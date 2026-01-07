@@ -30,6 +30,16 @@ bool verify_pattern(const std::vector<uint32_t>& data, uint32_t seed) {
     return true;
 }
 
+void mutate_words(std::vector<uint32_t>& data, uint32_t epoch) {
+    if (data.empty()) {
+        return;
+    }
+    for (uint32_t j = 0; j < 4; ++j) {
+        uint32_t index = (epoch * 7u + j * 13u) % static_cast<uint32_t>(data.size());
+        data[index] ^= 0xA5A50000u + epoch * 17u + j;
+    }
+}
+
 bool test_single_region() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
@@ -221,6 +231,149 @@ bool test_two_regions() {
     return ok;
 }
 
+bool test_delta_single_region() {
+    const uint32_t element_count = 512;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 16;
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc delta")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 65536;
+    cfg.epoch_capacity = 32;
+    cfg.region_capacity = 4;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.set_region_full_snapshot_period(0, 4)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_model(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+
+    fill_pattern(host_model, 0x12345678u);
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        if (epoch != 0) {
+            mutate_words(host_model, epoch);
+        }
+        if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy delta in")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        expected[epoch] = host_model;
+    }
+
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        if (!recorder.rewind_to_epoch(epoch, 0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy delta out")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (host_out != expected[epoch]) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
+bool test_wrap_marker() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 6;
+    const uint32_t target_epoch = 4;
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc wrap")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 4096;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_model(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        fill_pattern(host_model, 0xCAFE0000u + epoch);
+        if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy wrap in")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        expected[epoch] = host_model;
+    }
+
+    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy wrap out")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (host_out != expected[target_epoch]) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -233,6 +386,18 @@ int main() {
     bool ok_two = test_two_regions();
     if (!ok_two) {
         std::printf("test_two_regions failed\n");
+        return 1;
+    }
+
+    bool ok_delta = test_delta_single_region();
+    if (!ok_delta) {
+        std::printf("test_delta_single_region failed\n");
+        return 1;
+    }
+
+    bool ok_wrap = test_wrap_marker();
+    if (!ok_wrap) {
+        std::printf("test_wrap_marker failed\n");
         return 1;
     }
 

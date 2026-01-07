@@ -3,8 +3,8 @@
 ## v1 scope and limitations
 
 Snapshot-only recorder for CUDA device buffers. Assumptions:
-- Full snapshots only; no delta/compression.
-- Ring buffer is large enough to avoid wrap or overwrite.
+- Full snapshots only by default; delta chunks are available in Phase 2.
+- Ring buffer wrap markers are supported.
 - Chunks for an epoch are contiguous in ring order.
 - Rewind lookup scans epoch table on host.
 - No persistence; device memory only.
@@ -24,3 +24,7 @@ cmake --build build --config Release
 .\build\Release\tt_demo.exe
 .\build\Release\tt_tests.exe
 ```
+
+Demo flags:
+- `--no-delta` disables delta capture (snapshots only).
+- `--ring-bytes=<n>` overrides ring size. If too small for all epochs, rewind verification is skipped.
