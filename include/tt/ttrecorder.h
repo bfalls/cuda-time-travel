@@ -9,6 +9,8 @@
 
 namespace tt {
 
+struct DeviceEpochBegin;
+
 enum class OverwriteMode : uint32_t {
     kDropOldest = 0,
     kBackpressure = 1
@@ -36,6 +38,9 @@ struct RecorderConfig {
     uint32_t region_capacity = 0;
     uint32_t retention_epochs = 0;
     OverwriteMode overwrite_mode = OverwriteMode::kDropOldest;
+    bool enable_graph_stamps = false;
+    uint64_t* graph_stamps = nullptr;
+    uint32_t* graph_stamp_counter = nullptr;
 };
 
 class Recorder {
@@ -64,7 +69,13 @@ private:
     uint32_t* d_first_ring_offset_ = nullptr;
     uint32_t* d_first_was_written_ = nullptr;
     uint32_t* d_delta_sizes_ = nullptr;
+    DeviceEpochBegin* d_epoch_begin_ = nullptr;
+    uint32_t* d_stamp_base_ = nullptr;
+    std::vector<TrackedRegion> host_regions_{};
     bool enable_deltas_ = true;
+    bool enable_graph_stamps_ = false;
+    uint64_t* d_graph_stamps_ = nullptr;
+    uint32_t* d_graph_stamp_counter_ = nullptr;
     bool initialized_ = false;
     uint32_t min_valid_epoch_ = 0;
     RecorderStatus last_status_ = RecorderStatus::kOk;

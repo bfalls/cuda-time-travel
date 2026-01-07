@@ -8,6 +8,8 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(ttrecorder STATIC
     src/ttrecorder.cu
+    src/tt_graph.cpp
+    src/tt_trace.cpp
 )
 
 target_include_directories(ttrecorder
@@ -26,8 +28,14 @@ add_executable(tt_demo
 
 target_link_libraries(tt_demo PRIVATE ttrecorder)
 
+add_executable(tt_demo_graph
+    demo/tt_demo_graph.cu
+)
+
+target_link_libraries(tt_demo_graph PRIVATE ttrecorder)
+
 add_executable(tt_tests
-    tests/tt_tests.cpp
+    tests/tt_tests.cu
 )
 
 target_link_libraries(tt_tests PRIVATE ttrecorder)
