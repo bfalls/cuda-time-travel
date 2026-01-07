@@ -2,7 +2,10 @@
 #define TTRECORDER_H
 
 #include <cstdint>
+#include <vector>
 #include <cuda_runtime.h>
+
+#include "tt/tt_layout.h"
 
 namespace tt {
 
@@ -21,6 +24,15 @@ public:
 
     bool capture_epoch(cudaStream_t stream);
     bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
+    bool read_epochs_to_host(std::vector<EpochRecord>& out);
+
+private:
+    RecorderConfig cfg_{};
+    ControlBlock* d_control_ = nullptr;
+    uint8_t* d_ring_ = nullptr;
+    EpochRecord* d_epochs_ = nullptr;
+    TrackedRegion* d_regions_ = nullptr;
+    bool initialized_ = false;
 };
 
 } // namespace tt

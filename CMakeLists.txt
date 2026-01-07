@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(CUDAToolkit REQUIRED)
 
 add_library(ttrecorder STATIC
-    src/ttrecorder.cpp
+    src/ttrecorder.cu
 )
 
 target_include_directories(ttrecorder
