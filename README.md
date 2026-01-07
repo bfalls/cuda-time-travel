@@ -5,6 +5,7 @@
 Snapshot-only recorder for CUDA device buffers. Assumptions:
 - Full snapshots only by default; delta chunks are available in Phase 2.
 - Ring buffer wrap markers are supported.
+- Retention policy supports DROP_OLDEST and BACKPRESSURE modes.
 - Chunks for an epoch are contiguous in ring order.
 - Rewind lookup scans epoch table on host.
 - No persistence; device memory only.
@@ -28,3 +29,12 @@ cmake --build build --config Release
 Demo flags:
 - `--no-delta` disables delta capture (snapshots only).
 - `--ring-bytes=<n>` overrides ring size. If too small for all epochs, rewind verification is skipped.
+
+## Recorder config
+
+`RecorderConfig` supports:
+- `retention_epochs`: keep the last N epochs (0 keeps all until space pressure).
+- `overwrite_mode`: `DROP_OLDEST` (discard old epochs to make space) or `BACKPRESSURE` (fail capture when space is insufficient).
+
+Notes:
+- `ring_bytes` must be a multiple of 32 bytes.

@@ -9,10 +9,33 @@
 
 namespace tt {
 
+enum class OverwriteMode : uint32_t {
+    kDropOldest = 0,
+    kBackpressure = 1
+};
+
+enum class RecorderStatus : uint32_t {
+    kOk = 0,
+    kNotInitialized,
+    kInvalidConfig,
+    kCudaError,
+    kBackpressure,
+    kRingTooSmall,
+    kRingCorrupt,
+    kInvalidHeader,
+    kInvalidChunkType,
+    kInvalidPayload,
+    kAlignmentError,
+    kEpochNotFound,
+    kEpochDropped
+};
+
 struct RecorderConfig {
     uint32_t ring_bytes = 0;
     uint32_t epoch_capacity = 0;
     uint32_t region_capacity = 0;
+    uint32_t retention_epochs = 0;
+    OverwriteMode overwrite_mode = OverwriteMode::kDropOldest;
 };
 
 class Recorder {
@@ -26,6 +49,7 @@ public:
     bool capture_epoch(cudaStream_t stream);
     bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
     bool read_epochs_to_host(std::vector<EpochRecord>& out);
+    RecorderStatus last_status() const { return last_status_; }
 
 private:
     RecorderConfig cfg_{};
@@ -39,8 +63,11 @@ private:
     uint64_t* d_scratch_ptrs_ = nullptr;
     uint32_t* d_first_ring_offset_ = nullptr;
     uint32_t* d_first_was_written_ = nullptr;
+    uint32_t* d_delta_sizes_ = nullptr;
     bool enable_deltas_ = true;
     bool initialized_ = false;
+    uint32_t min_valid_epoch_ = 0;
+    RecorderStatus last_status_ = RecorderStatus::kOk;
 };
 
 } // namespace tt

@@ -41,11 +41,22 @@ int main() {
 
     uint32_t ring_bytes = size_bytes * 2 * epoch_count + 4096;
     bool enable_deltas = true;
+    uint32_t retention_epochs = 0;
+    tt::OverwriteMode overwrite_mode = tt::OverwriteMode::kDropOldest;
     for (int i = 1; i < __argc; ++i) {
         if (std::strcmp(__argv[i], "--no-delta") == 0) {
             enable_deltas = false;
         } else if (std::strncmp(__argv[i], "--ring-bytes=", 13) == 0) {
             ring_bytes = static_cast<uint32_t>(std::strtoul(__argv[i] + 13, nullptr, 10));
+        } else if (std::strncmp(__argv[i], "--retention-epochs=", 19) == 0) {
+            retention_epochs = static_cast<uint32_t>(std::strtoul(__argv[i] + 19, nullptr, 10));
+        } else if (std::strncmp(__argv[i], "--overwrite-mode=", 17) == 0) {
+            const char* mode = __argv[i] + 17;
+            if (std::strcmp(mode, "backpressure") == 0) {
+                overwrite_mode = tt::OverwriteMode::kBackpressure;
+            } else if (std::strcmp(mode, "drop") == 0) {
+                overwrite_mode = tt::OverwriteMode::kDropOldest;
+            }
         }
     }
 
@@ -59,7 +70,7 @@ int main() {
         return 1;
     }
 
-    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 15u) & ~15u;
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
     const uint32_t per_epoch_bytes = per_chunk_bytes * 2u;
     const uint64_t required_bytes = static_cast<uint64_t>(per_epoch_bytes) * static_cast<uint64_t>(epoch_count);
     bool can_rewind = true;
@@ -81,6 +92,8 @@ int main() {
     cfg.ring_bytes = ring_bytes;
     cfg.epoch_capacity = 32;
     cfg.region_capacity = 8;
+    cfg.retention_epochs = retention_epochs;
+    cfg.overwrite_mode = overwrite_mode;
     if (!recorder.init(cfg)) {
         std::printf("recorder init failed\n");
         cudaFree(d_buffer_b);
@@ -131,7 +144,7 @@ int main() {
         const bool is_snapshot = (!enable_deltas) || (snapshot_period == 0u) || ((epoch % snapshot_period) == 0u);
         const uint32_t payload_bytes = size_bytes;
         const uint32_t chunk_bytes = static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + payload_bytes;
-        const uint32_t aligned_bytes = (chunk_bytes + 15u) & ~15u;
+        const uint32_t aligned_bytes = (chunk_bytes + 31u) & ~31u;
         std::printf("epoch %u: %s payload=%u total=%u ring_bytes=%u\n",
             epoch,
             is_snapshot ? "snapshot" : "delta",
