@@ -60,6 +60,8 @@ bool test_single_region() {
     cfg.ring_bytes = 4096;
     cfg.epoch_capacity = 8;
     cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
         return false;
@@ -145,6 +147,8 @@ bool test_two_regions() {
     cfg.ring_bytes = 8192;
     cfg.epoch_capacity = 8;
     cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer_b);
         cudaFree(d_buffer_a);
@@ -246,6 +250,8 @@ bool test_delta_single_region() {
     cfg.ring_bytes = 65536;
     cfg.epoch_capacity = 32;
     cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
         return false;
@@ -323,6 +329,8 @@ bool test_wrap_marker() {
     cfg.ring_bytes = 4096;
     cfg.epoch_capacity = 16;
     cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
         return false;
@@ -374,6 +382,227 @@ bool test_wrap_marker() {
     return true;
 }
 
+bool test_tiny_ring_wrap() {
+    const uint32_t element_count = 64;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 5;
+    const uint32_t target_epoch = epoch_count - 1;
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc tiny wrap")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 640;
+    cfg.epoch_capacity = 8;
+    cfg.region_capacity = 2;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_model(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    std::vector<uint32_t> expected_last(element_count);
+
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        fill_pattern(host_model, 0xBEEF0000u + epoch);
+        if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy tiny wrap in")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (epoch == target_epoch) {
+            expected_last = host_model;
+        }
+    }
+
+    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy tiny wrap out")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (host_out != expected_last) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
+bool test_overwrite_retention() {
+    const uint32_t element_count = 64;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 6;
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc retention")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 4096;
+    cfg.epoch_capacity = 8;
+    cfg.region_capacity = 2;
+    cfg.retention_epochs = 3;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_model(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        fill_pattern(host_model, 0xABCD0000u + epoch);
+        if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy retention in")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        expected[epoch] = host_model;
+    }
+
+    if (recorder.rewind_to_epoch(2, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.rewind_to_epoch(4, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy retention out")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (host_out != expected[4]) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
+bool test_backpressure() {
+    const uint32_t element_count = 64;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc backpressure")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 320;
+    cfg.epoch_capacity = 4;
+    cfg.region_capacity = 2;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kBackpressure;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_a(element_count);
+    std::vector<uint32_t> host_b(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    fill_pattern(host_a, 0x12340000u);
+    fill_pattern(host_b, 0x56780000u);
+
+    if (!check_cuda(cudaMemcpy(d_buffer, host_a.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy backpressure A")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.capture_epoch(0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!check_cuda(cudaMemcpy(d_buffer, host_b.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy backpressure B")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (recorder.capture_epoch(0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.rewind_to_epoch(0, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy backpressure out")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (host_out != host_a) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -398,6 +627,24 @@ int main() {
     bool ok_wrap = test_wrap_marker();
     if (!ok_wrap) {
         std::printf("test_wrap_marker failed\n");
+        return 1;
+    }
+
+    bool ok_tiny_wrap = test_tiny_ring_wrap();
+    if (!ok_tiny_wrap) {
+        std::printf("test_tiny_ring_wrap failed\n");
+        return 1;
+    }
+
+    bool ok_retention = test_overwrite_retention();
+    if (!ok_retention) {
+        std::printf("test_overwrite_retention failed\n");
+        return 1;
+    }
+
+    bool ok_backpressure = test_backpressure();
+    if (!ok_backpressure) {
+        std::printf("test_backpressure failed\n");
         return 1;
     }
 

@@ -21,7 +21,11 @@ struct alignas(64) ControlBlock {
     uint32_t epoch_capacity;
     uint32_t region_capacity;
     uint32_t flags;
-    uint8_t padding[32];
+    uint32_t min_valid_epoch;
+    uint32_t overwrite_mode;
+    uint32_t retention_epochs;
+    uint32_t reserved0;
+    uint8_t padding[16];
 };
 
 struct alignas(32) TrackedRegion {

@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <vector>
+#include <cstddef>
 
 #include "tt/tt_layout.h"
 
@@ -14,8 +15,10 @@ struct EpochBegin {
     uint32_t epoch_index_pos;
 };
 
-__host__ __device__ inline uint32_t align16(uint32_t value) {
-    return (value + 15u) & ~15u;
+static constexpr uint32_t kRingAlignment = 32u;
+
+__host__ __device__ inline uint32_t align_up(uint32_t value) {
+    return (value + (kRingAlignment - 1u)) & ~(kRingAlignment - 1u);
 }
 
 __device__ inline void reserve_and_get_ring_offset(ControlBlock* control,
@@ -29,24 +32,28 @@ __device__ inline void reserve_and_get_ring_offset(ControlBlock* control,
     uint32_t used_wrap = 0;
 
     if (ring_offset + total_bytes_aligned > ring_bytes) {
-        uint32_t marker_bytes = align16(static_cast<uint32_t>(sizeof(ChunkHeader)));
-        uint64_t marker_pos = atomicAdd(&control->write_pos, static_cast<uint64_t>(marker_bytes));
-        uint32_t marker_offset = static_cast<uint32_t>(marker_pos % ring_bytes);
-        ChunkHeader* marker = reinterpret_cast<ChunkHeader*>(ring + marker_offset);
-        marker->magic = kChunkMagic;
-        marker->version = kChunkVersion;
-        marker->header_bytes = kChunkHeaderBytes;
-        marker->epoch_id = 0;
-        marker->region_id = 0;
-        marker->chunk_type = kChunkTypeWrapMarker;
-        marker->payload_bytes = 0;
-        marker->uncompressed_bytes = 0;
-        marker->flags = kChunkFlagWrapMarker;
-
+        uint32_t marker_bytes = align_up(static_cast<uint32_t>(sizeof(ChunkHeader)));
         uint32_t remainder = ring_bytes - ring_offset;
-        if (remainder > marker_bytes) {
-            uint32_t pad_bytes = remainder - marker_bytes;
-            atomicAdd(&control->write_pos, static_cast<uint64_t>(pad_bytes));
+        if (remainder >= marker_bytes) {
+            uint64_t marker_pos = atomicAdd(&control->write_pos, static_cast<uint64_t>(marker_bytes));
+            uint32_t marker_offset = static_cast<uint32_t>(marker_pos % ring_bytes);
+            ChunkHeader* marker = reinterpret_cast<ChunkHeader*>(ring + marker_offset);
+            marker->magic = kChunkMagic;
+            marker->version = kChunkVersion;
+            marker->header_bytes = kChunkHeaderBytes;
+            marker->epoch_id = 0;
+            marker->region_id = 0;
+            marker->chunk_type = kChunkTypeWrapMarker;
+            marker->payload_bytes = 0;
+            marker->uncompressed_bytes = 0;
+            marker->flags = kChunkFlagWrapMarker;
+
+            if (remainder > marker_bytes) {
+                uint32_t pad_bytes = remainder - marker_bytes;
+                atomicAdd(&control->write_pos, static_cast<uint64_t>(pad_bytes));
+            }
+        } else if (remainder > 0u) {
+            atomicAdd(&control->write_pos, static_cast<uint64_t>(remainder));
         }
 
         current_pos = atomicAdd(&control->write_pos, static_cast<uint64_t>(total_bytes_aligned));
@@ -87,7 +94,7 @@ __global__ void snapshot_region_kernel(ControlBlock* control,
         }
 
         uint32_t payload_bytes = region->size_bytes;
-        uint32_t total_bytes = align16(static_cast<uint32_t>(sizeof(ChunkHeader)) + payload_bytes);
+        uint32_t total_bytes = align_up(static_cast<uint32_t>(sizeof(ChunkHeader)) + payload_bytes);
         uint32_t ring_offset = 0;
         reserve_and_get_ring_offset(control, ring, ring_bytes, total_bytes, &ring_offset, nullptr);
 
@@ -128,25 +135,30 @@ __global__ void snapshot_region_kernel(ControlBlock* control,
     }
 }
 
-__global__ void delta_region_kernel(ControlBlock* control,
-    const TrackedRegion* region,
+__global__ void delta_prepare_kernel(const TrackedRegion* region,
     const uint64_t* baseline_ptrs,
     const uint64_t* scratch_ptrs,
-    uint8_t* ring,
-    uint32_t ring_bytes,
-    uint32_t epoch_id,
-    uint32_t* first_ring_offset) {
+    uint32_t* out_payload_bytes) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         if ((region->options & 1u) == 0u || region->size_bytes == 0) {
+            if (out_payload_bytes) {
+                out_payload_bytes[region->region_id] = 0u;
+            }
             return;
         }
         if ((region->size_bytes % 4u) != 0u) {
+            if (out_payload_bytes) {
+                out_payload_bytes[region->region_id] = 0u;
+            }
             return;
         }
 
         const uint8_t* baseline_ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(baseline_ptrs[region->region_id]));
         uint8_t* scratch_ptr = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(scratch_ptrs[region->region_id]));
         if (baseline_ptr == nullptr || scratch_ptr == nullptr) {
+            if (out_payload_bytes) {
+                out_payload_bytes[region->region_id] = 0u;
+            }
             return;
         }
 
@@ -195,9 +207,38 @@ __global__ void delta_region_kernel(ControlBlock* control,
 
         scratch_words[0] = word_count;
         scratch_words[1] = block_count;
+        if (out_payload_bytes) {
+            out_payload_bytes[region->region_id] = scratch_index * sizeof(uint32_t);
+        }
+    }
+}
 
-        uint32_t payload_bytes = scratch_index * sizeof(uint32_t);
-        uint32_t total_bytes = align16(static_cast<uint32_t>(sizeof(ChunkHeader)) + payload_bytes);
+__global__ void delta_write_kernel(ControlBlock* control,
+    const TrackedRegion* region,
+    const uint64_t* baseline_ptrs,
+    const uint64_t* scratch_ptrs,
+    uint8_t* ring,
+    uint32_t ring_bytes,
+    uint32_t epoch_id,
+    uint32_t payload_bytes,
+    uint32_t* first_ring_offset) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if ((region->options & 1u) == 0u || region->size_bytes == 0) {
+            return;
+        }
+        if ((region->size_bytes % 4u) != 0u) {
+            return;
+        }
+        if (payload_bytes == 0u) {
+            return;
+        }
+
+        const uint8_t* scratch_ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(scratch_ptrs[region->region_id]));
+        if (scratch_ptr == nullptr) {
+            return;
+        }
+
+        uint32_t total_bytes = align_up(static_cast<uint32_t>(sizeof(ChunkHeader)) + payload_bytes);
         uint32_t ring_offset = 0;
         reserve_and_get_ring_offset(control, ring, ring_bytes, total_bytes, &ring_offset, nullptr);
 
@@ -217,14 +258,21 @@ __global__ void delta_region_kernel(ControlBlock* control,
         header->flags = 0;
 
         uint8_t* payload_dst = ring + ring_offset + sizeof(ChunkHeader);
-        const uint8_t* payload_src = scratch_ptr;
         for (uint32_t b = 0; b < payload_bytes; ++b) {
-            payload_dst[b] = payload_src[b];
+            payload_dst[b] = scratch_ptr[b];
         }
 
-        uint32_t* baseline_out = reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(baseline_ptr));
-        for (uint32_t w = 0; w < word_count; ++w) {
-            baseline_out[w] = current_words[w];
+        if (baseline_ptrs) {
+            const uint8_t* current_ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(region->base_ptr));
+            uint8_t* baseline_ptr = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(baseline_ptrs[region->region_id]));
+            if (baseline_ptr && current_ptr) {
+                const uint32_t word_count = region->size_bytes / 4u;
+                const uint32_t* current_words = reinterpret_cast<const uint32_t*>(current_ptr);
+                uint32_t* baseline_out = reinterpret_cast<uint32_t*>(baseline_ptr);
+                for (uint32_t w = 0; w < word_count; ++w) {
+                    baseline_out[w] = current_words[w];
+                }
+            }
         }
     }
 }
@@ -344,7 +392,77 @@ __global__ void apply_delta_chunk_kernel(const TrackedRegion* regions,
     }
 }
 
-bool rewind_apply_epoch(const EpochRecord& record,
+RecorderStatus read_chunk_header(const uint8_t* ring,
+    uint32_t ring_bytes,
+    uint32_t ring_offset,
+    ChunkHeader* out_header,
+    cudaStream_t stream) {
+    if (ring_offset % kRingAlignment != 0u) {
+        return RecorderStatus::kAlignmentError;
+    }
+    if (ring_offset + sizeof(ChunkHeader) > ring_bytes) {
+        return RecorderStatus::kInvalidHeader;
+    }
+
+    cudaError_t err = cudaMemcpyAsync(out_header,
+        ring + ring_offset,
+        sizeof(ChunkHeader),
+        cudaMemcpyDeviceToHost,
+        stream);
+    if (err != cudaSuccess) {
+        return RecorderStatus::kCudaError;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        return RecorderStatus::kCudaError;
+    }
+
+    if (out_header->magic != kChunkMagic) {
+        return RecorderStatus::kInvalidHeader;
+    }
+    if (out_header->version != kChunkVersion) {
+        return RecorderStatus::kInvalidHeader;
+    }
+    if (out_header->header_bytes != kChunkHeaderBytes || out_header->header_bytes != sizeof(ChunkHeader)) {
+        return RecorderStatus::kInvalidHeader;
+    }
+    if ((out_header->header_bytes % kRingAlignment) != 0u) {
+        return RecorderStatus::kAlignmentError;
+    }
+
+    if (out_header->chunk_type != kChunkTypeSnapshot &&
+        out_header->chunk_type != kChunkTypeDeltaXorRle0 &&
+        out_header->chunk_type != kChunkTypeWrapMarker) {
+        return RecorderStatus::kInvalidChunkType;
+    }
+
+    const uint32_t payload_bytes = out_header->payload_bytes;
+    if (payload_bytes > ring_bytes - out_header->header_bytes) {
+        return RecorderStatus::kInvalidPayload;
+    }
+    if (ring_offset + out_header->header_bytes + payload_bytes > ring_bytes) {
+        return RecorderStatus::kInvalidPayload;
+    }
+
+    if (out_header->chunk_type == kChunkTypeWrapMarker) {
+        if (payload_bytes != 0u) {
+            return RecorderStatus::kInvalidPayload;
+        }
+        return RecorderStatus::kOk;
+    }
+
+    if (payload_bytes == 0u || (payload_bytes % 4u) != 0u) {
+        return RecorderStatus::kInvalidPayload;
+    }
+    if ((out_header->chunk_type == kChunkTypeDeltaXorRle0) &&
+        (out_header->uncompressed_bytes == 0u || (out_header->uncompressed_bytes % 4u) != 0u)) {
+        return RecorderStatus::kInvalidPayload;
+    }
+
+    return RecorderStatus::kOk;
+}
+
+RecorderStatus rewind_apply_epoch(const EpochRecord& record,
     TrackedRegion* d_regions,
     uint32_t region_capacity,
     const uint64_t* baseline_ptrs,
@@ -352,32 +470,27 @@ bool rewind_apply_epoch(const EpochRecord& record,
     uint32_t ring_bytes,
     cudaStream_t stream) {
     if (record.chunk_count == 0) {
-        return true;
+        return RecorderStatus::kOk;
     }
 
     uint32_t ring_offset = record.ring_offset;
     uint32_t applied = 0;
+    uint32_t guard = 0;
     while (applied < record.chunk_count) {
+        if (guard++ > record.chunk_count + 4u) {
+            return RecorderStatus::kRingCorrupt;
+        }
         ChunkHeader host_header{};
-        cudaError_t err = cudaMemcpyAsync(&host_header,
-            ring + ring_offset,
-            sizeof(ChunkHeader),
-            cudaMemcpyDeviceToHost,
-            stream);
-        if (err != cudaSuccess) {
-            return false;
-        }
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) {
-            return false;
-        }
-
-        if (host_header.magic != kChunkMagic) {
-            return false;
+        RecorderStatus status = read_chunk_header(ring, ring_bytes, ring_offset, &host_header, stream);
+        if (status != RecorderStatus::kOk) {
+            return status;
         }
 
         if (host_header.chunk_type == kChunkTypeWrapMarker || (host_header.flags & kChunkFlagWrapMarker) != 0u) {
-            ring_offset = 0;
+            if (ring_offset == 0u) {
+                return RecorderStatus::kRingCorrupt;
+            }
+            ring_offset = 0u;
             continue;
         }
 
@@ -386,14 +499,14 @@ bool rewind_apply_epoch(const EpochRecord& record,
         } else if (host_header.chunk_type == kChunkTypeDeltaXorRle0) {
             apply_delta_chunk_kernel<<<1, 1, 0, stream>>>(d_regions, region_capacity, baseline_ptrs, ring, ring_offset);
         } else {
-            return false;
+            return RecorderStatus::kInvalidChunkType;
         }
-        err = cudaGetLastError();
+        cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            return false;
+            return RecorderStatus::kCudaError;
         }
 
-        uint32_t chunk_bytes = align16(static_cast<uint32_t>(sizeof(ChunkHeader)) + host_header.payload_bytes);
+        uint32_t chunk_bytes = align_up(static_cast<uint32_t>(sizeof(ChunkHeader)) + host_header.payload_bytes);
         ring_offset += chunk_bytes;
         if (ring_offset >= ring_bytes) {
             ring_offset -= ring_bytes;
@@ -401,7 +514,7 @@ bool rewind_apply_epoch(const EpochRecord& record,
         ++applied;
     }
 
-    return true;
+    return RecorderStatus::kOk;
 }
 
 } // namespace
@@ -411,7 +524,17 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
     }
 
+    last_status_ = RecorderStatus::kOk;
     if (cfg.ring_bytes == 0 || cfg.epoch_capacity == 0 || cfg.region_capacity == 0) {
+        last_status_ = RecorderStatus::kInvalidConfig;
+        return false;
+    }
+    if ((cfg.ring_bytes % kRingAlignment) != 0u) {
+        last_status_ = RecorderStatus::kInvalidConfig;
+        return false;
+    }
+    if (cfg.retention_epochs > 0 && cfg.retention_epochs > cfg.epoch_capacity) {
+        last_status_ = RecorderStatus::kInvalidConfig;
         return false;
     }
 
@@ -458,12 +581,20 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
+    err = cudaMalloc(reinterpret_cast<void**>(&d_delta_sizes_), sizeof(uint32_t) * cfg_.region_capacity);
+    if (err != cudaSuccess) {
+        shutdown();
+        return false;
+    }
 
     ControlBlock host_control{};
     std::memset(&host_control, 0, sizeof(host_control));
     host_control.ring_bytes = cfg_.ring_bytes;
     host_control.epoch_capacity = cfg_.epoch_capacity;
     host_control.region_capacity = cfg_.region_capacity;
+    host_control.min_valid_epoch = 0u;
+    host_control.overwrite_mode = static_cast<uint32_t>(cfg_.overwrite_mode);
+    host_control.retention_epochs = cfg_.retention_epochs;
 
     err = cudaMemcpy(d_control_, &host_control, sizeof(ControlBlock), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -506,8 +637,14 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
+    err = cudaMemset(d_delta_sizes_, 0, sizeof(uint32_t) * cfg_.region_capacity);
+    if (err != cudaSuccess) {
+        shutdown();
+        return false;
+    }
 
     initialized_ = true;
+    min_valid_epoch_ = 0u;
     return true;
 }
 
@@ -542,6 +679,10 @@ void Recorder::shutdown() {
         cudaFree(d_first_ring_offset_);
         d_first_ring_offset_ = nullptr;
     }
+    if (d_delta_sizes_) {
+        cudaFree(d_delta_sizes_);
+        d_delta_sizes_ = nullptr;
+    }
     if (d_regions_) {
         cudaFree(d_regions_);
         d_regions_ = nullptr;
@@ -560,6 +701,8 @@ void Recorder::shutdown() {
     }
     initialized_ = false;
     cfg_ = RecorderConfig{};
+    min_valid_epoch_ = 0u;
+    last_status_ = RecorderStatus::kOk;
 }
 
 bool Recorder::register_region(uint32_t region_id, void* device_ptr, uint32_t size_bytes, uint32_t options) {
@@ -686,13 +829,23 @@ bool Recorder::set_region_full_snapshot_period(uint32_t region_id, uint32_t peri
 }
 
 bool Recorder::capture_epoch(cudaStream_t stream) {
+    last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
+        last_status_ = RecorderStatus::kNotInitialized;
+        return false;
+    }
+
+    ControlBlock host_control{};
+    cudaError_t err = cudaMemcpy(&host_control, d_control_, sizeof(ControlBlock), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
     EpochBegin* d_begin = nullptr;
-    cudaError_t err = cudaMalloc(reinterpret_cast<void**>(&d_begin), sizeof(EpochBegin));
+    err = cudaMalloc(reinterpret_cast<void**>(&d_begin), sizeof(EpochBegin));
     if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
@@ -700,6 +853,7 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         cudaFree(d_begin);
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
@@ -707,11 +861,13 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     err = cudaMemcpyAsync(&host_begin, d_begin, sizeof(EpochBegin), cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         cudaFree(d_begin);
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         cudaFree(d_begin);
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
     cudaFree(d_begin);
@@ -720,12 +876,71 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     std::vector<TrackedRegion> host_regions(cfg_.region_capacity);
     err = cudaMemcpy(host_regions.data(), d_regions_, sizeof(TrackedRegion) * cfg_.region_capacity, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
-    uint32_t enabled_count = 0;
-    uint32_t first_ring_offset = 0;
-    bool first_written = false;
+    std::vector<uint32_t> delta_sizes(cfg_.region_capacity, 0u);
+    if (enable_deltas_) {
+        err = cudaMemset(d_delta_sizes_, 0, sizeof(uint32_t) * cfg_.region_capacity);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+
+        for (uint32_t i = 0; i < cfg_.region_capacity; ++i) {
+            const TrackedRegion& region = host_regions[i];
+            if ((region.options & 1u) == 0u || region.size_bytes == 0u || region.base_ptr == 0u) {
+                continue;
+            }
+
+            bool should_snapshot = (region.full_snapshot_period == 0u);
+            if (!should_snapshot && !enable_deltas_) {
+                should_snapshot = true;
+            }
+            if (!should_snapshot && region.full_snapshot_period > 0u) {
+                should_snapshot = ((host_begin.epoch_id % region.full_snapshot_period) == 0u);
+            }
+            if (should_snapshot) {
+                continue;
+            }
+
+            delta_prepare_kernel<<<1, 1, 0, stream>>>(
+                d_regions_ + i,
+                d_baseline_ptrs_,
+                d_scratch_ptrs_,
+                d_delta_sizes_);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
+
+        err = cudaMemcpyAsync(delta_sizes.data(),
+            d_delta_sizes_,
+            sizeof(uint32_t) * cfg_.region_capacity,
+            cudaMemcpyDeviceToHost,
+            stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+        err = cudaStreamSynchronize(stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
+
+    struct PendingChunk {
+        uint32_t region_index;
+        uint32_t chunk_type;
+        uint32_t payload_bytes;
+        uint32_t total_bytes;
+    };
+    std::vector<PendingChunk> pending;
+    pending.reserve(cfg_.region_capacity);
 
     for (uint32_t i = 0; i < cfg_.region_capacity; ++i) {
         const TrackedRegion& region = host_regions[i];
@@ -736,11 +951,6 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             continue;
         }
 
-        uint32_t* first_offset_ptr = nullptr;
-        if (!first_written) {
-            first_offset_ptr = d_first_ring_offset_;
-        }
-
         bool should_snapshot = (region.full_snapshot_period == 0u);
         if (!should_snapshot && !enable_deltas_) {
             should_snapshot = true;
@@ -749,53 +959,257 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             should_snapshot = ((host_begin.epoch_id % region.full_snapshot_period) == 0u);
         }
 
+        uint32_t payload_bytes = 0;
+        uint32_t chunk_type = kChunkTypeSnapshot;
         if (should_snapshot) {
+            payload_bytes = region.size_bytes;
+            chunk_type = kChunkTypeSnapshot;
+        } else {
+            payload_bytes = delta_sizes[i];
+            chunk_type = kChunkTypeDeltaXorRle0;
+            if (payload_bytes == 0u) {
+                last_status_ = RecorderStatus::kInvalidPayload;
+                return false;
+            }
+        }
+
+        uint32_t total_bytes = align_up(static_cast<uint32_t>(sizeof(ChunkHeader)) + payload_bytes);
+        if (total_bytes > cfg_.ring_bytes) {
+            last_status_ = RecorderStatus::kRingTooSmall;
+            return false;
+        }
+        pending.push_back({i, chunk_type, payload_bytes, total_bytes});
+    }
+
+    uint32_t min_valid_epoch = min_valid_epoch_;
+    if (cfg_.retention_epochs > 0 && host_begin.epoch_id + 1u > cfg_.retention_epochs) {
+        uint32_t retention_min = host_begin.epoch_id - cfg_.retention_epochs + 1u;
+        if (retention_min > min_valid_epoch) {
+            min_valid_epoch = retention_min;
+        }
+    }
+
+    std::vector<EpochRecord> host_epochs;
+    host_epochs.resize(cfg_.epoch_capacity);
+    err = cudaMemcpy(host_epochs.data(),
+        d_epochs_,
+        sizeof(EpochRecord) * cfg_.epoch_capacity,
+        cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        return false;
+    }
+
+    struct EpochEntry {
+        uint32_t index;
+        uint32_t epoch_id;
+        uint32_t bytes;
+    };
+    std::vector<EpochEntry> valid_epochs;
+    valid_epochs.reserve(cfg_.epoch_capacity);
+    std::vector<uint32_t> clear_indices;
+
+    uint64_t used_bytes = 0;
+    for (uint32_t i = 0; i < cfg_.epoch_capacity; ++i) {
+        const EpochRecord& record = host_epochs[i];
+        if (record.chunk_count == 0u) {
+            continue;
+        }
+        if (record.epoch_id < min_valid_epoch) {
+            clear_indices.push_back(i);
+            continue;
+        }
+        if (record.chunk_count > cfg_.region_capacity || record.reserved0 == 0u) {
+            clear_indices.push_back(i);
+            continue;
+        }
+        uint32_t expected_generation = record.epoch_id / cfg_.epoch_capacity;
+        if (record.reserved1 != expected_generation) {
+            clear_indices.push_back(i);
+            continue;
+        }
+
+        used_bytes += record.reserved0;
+        valid_epochs.push_back({i, record.epoch_id, record.reserved0});
+    }
+
+    auto drop_oldest = [&](uint32_t* io_min_valid_epoch) {
+        if (valid_epochs.empty()) {
+            return false;
+        }
+        size_t oldest_index = 0;
+        for (size_t idx = 1; idx < valid_epochs.size(); ++idx) {
+            if (valid_epochs[idx].epoch_id < valid_epochs[oldest_index].epoch_id) {
+                oldest_index = idx;
+            }
+        }
+        const EpochEntry dropped = valid_epochs[oldest_index];
+        clear_indices.push_back(dropped.index);
+        used_bytes -= dropped.bytes;
+        if (io_min_valid_epoch && dropped.epoch_id + 1u > *io_min_valid_epoch) {
+            *io_min_valid_epoch = dropped.epoch_id + 1u;
+        }
+        valid_epochs.erase(valid_epochs.begin() + static_cast<std::ptrdiff_t>(oldest_index));
+        return true;
+    };
+
+    if (cfg_.overwrite_mode == OverwriteMode::kBackpressure) {
+        if (cfg_.retention_epochs > 0 && valid_epochs.size() >= cfg_.retention_epochs) {
+            last_status_ = RecorderStatus::kBackpressure;
+            return false;
+        }
+    } else {
+        if (cfg_.retention_epochs > 0) {
+            while (valid_epochs.size() >= cfg_.retention_epochs) {
+                drop_oldest(&min_valid_epoch);
+            }
+        }
+    }
+
+    uint64_t estimated_bytes = 0;
+    uint32_t ring_offset = static_cast<uint32_t>(host_control.write_pos % cfg_.ring_bytes);
+    for (const PendingChunk& chunk : pending) {
+        if (ring_offset + chunk.total_bytes > cfg_.ring_bytes) {
+            uint32_t remainder = cfg_.ring_bytes - ring_offset;
+            estimated_bytes += remainder;
+            ring_offset = 0u;
+        }
+        estimated_bytes += chunk.total_bytes;
+        ring_offset += chunk.total_bytes;
+        if (ring_offset >= cfg_.ring_bytes) {
+            ring_offset -= cfg_.ring_bytes;
+        }
+    }
+
+    if (estimated_bytes > cfg_.ring_bytes) {
+        last_status_ = RecorderStatus::kRingTooSmall;
+        return false;
+    }
+
+    if (cfg_.overwrite_mode == OverwriteMode::kBackpressure) {
+        if (estimated_bytes > (cfg_.ring_bytes - used_bytes)) {
+            last_status_ = RecorderStatus::kBackpressure;
+            return false;
+        }
+    } else {
+        while (estimated_bytes > (cfg_.ring_bytes - used_bytes)) {
+            if (!drop_oldest(&min_valid_epoch)) {
+                last_status_ = RecorderStatus::kRingTooSmall;
+                return false;
+            }
+        }
+    }
+
+    if (!clear_indices.empty() || min_valid_epoch != min_valid_epoch_) {
+        EpochRecord zero_record{};
+        for (uint32_t index : clear_indices) {
+            const size_t epoch_offset_bytes = sizeof(EpochRecord) * static_cast<size_t>(index);
+            err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_epochs_) + epoch_offset_bytes,
+                &zero_record,
+                sizeof(EpochRecord),
+                cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
+        min_valid_epoch_ = min_valid_epoch;
+        const size_t offset = offsetof(ControlBlock, min_valid_epoch);
+        err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_control_) + offset,
+            &min_valid_epoch_,
+            sizeof(uint32_t),
+            cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
+
+    uint32_t enabled_count = static_cast<uint32_t>(pending.size());
+    uint32_t first_ring_offset = 0;
+    bool first_written = false;
+    if (enabled_count > 0) {
+        err = cudaMemset(d_first_ring_offset_, 0, sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
+
+    for (const PendingChunk& chunk : pending) {
+        uint32_t* first_offset_ptr = nullptr;
+        if (!first_written) {
+            first_offset_ptr = d_first_ring_offset_;
+        }
+
+        if (chunk.chunk_type == kChunkTypeSnapshot) {
             snapshot_region_kernel<<<1, 1, 0, stream>>>(
                 d_control_,
-                d_regions_ + i,
+                d_regions_ + chunk.region_index,
                 d_baseline_ptrs_,
                 d_ring_,
                 cfg_.ring_bytes,
                 host_begin.epoch_id,
                 first_offset_ptr);
         } else {
-            delta_region_kernel<<<1, 1, 0, stream>>>(
+            delta_write_kernel<<<1, 1, 0, stream>>>(
                 d_control_,
-                d_regions_ + i,
+                d_regions_ + chunk.region_index,
                 d_baseline_ptrs_,
                 d_scratch_ptrs_,
                 d_ring_,
                 cfg_.ring_bytes,
                 host_begin.epoch_id,
+                chunk.payload_bytes,
                 first_offset_ptr);
         }
         err = cudaGetLastError();
         if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
             return false;
         }
 
         if (!first_written) {
             err = cudaMemcpyAsync(&first_ring_offset, d_first_ring_offset_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
             if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
                 return false;
             }
             err = cudaStreamSynchronize(stream);
             if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
                 return false;
             }
             first_written = true;
         }
+    }
 
-        ++enabled_count;
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        return false;
+    }
+
+    ControlBlock host_control_after{};
+    err = cudaMemcpy(&host_control_after, d_control_, sizeof(ControlBlock), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        return false;
+    }
+
+    uint64_t epoch_bytes = host_control_after.write_pos - host_control.write_pos;
+    if (epoch_bytes > UINT32_MAX) {
+        last_status_ = RecorderStatus::kRingCorrupt;
+        return false;
     }
 
     EpochRecord record{};
     record.epoch_id = host_begin.epoch_id;
     record.chunk_count = enabled_count;
     record.region_count = enabled_count;
-    record.reserved0 = 0;
+    record.reserved0 = static_cast<uint32_t>(epoch_bytes);
     record.ring_offset = first_written ? first_ring_offset : 0u;
-    record.reserved1 = 0;
+    record.reserved1 = host_begin.epoch_id / cfg_.epoch_capacity;
     record.timestamp = 0;
 
     const size_t epoch_offset_bytes = sizeof(EpochRecord) * static_cast<size_t>(host_begin.epoch_index_pos);
@@ -804,6 +1218,7 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         sizeof(EpochRecord),
         cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
@@ -811,7 +1226,13 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
 }
 
 bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
+    last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
+        last_status_ = RecorderStatus::kNotInitialized;
+        return false;
+    }
+    if (target_epoch < min_valid_epoch_) {
+        last_status_ = RecorderStatus::kEpochDropped;
         return false;
     }
 
@@ -824,23 +1245,37 @@ bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
     bool any_chunks = false;
     uint32_t min_epoch = UINT32_MAX;
     for (const EpochRecord& record : host_epochs) {
+        if (record.chunk_count == 0) {
+            continue;
+        }
+        if (record.epoch_id < min_valid_epoch_) {
+            continue;
+        }
+        if (record.reserved0 == 0u) {
+            continue;
+        }
+        uint32_t expected_generation = record.epoch_id / cfg_.epoch_capacity;
+        if (record.reserved1 != expected_generation) {
+            continue;
+        }
+        any_chunks = true;
+        if (record.epoch_id < min_epoch) {
+            min_epoch = record.epoch_id;
+        }
         if (record.epoch_id == target_epoch) {
             found_target = true;
         }
-        if (record.chunk_count > 0) {
-            any_chunks = true;
-            if (record.epoch_id < min_epoch) {
-                min_epoch = record.epoch_id;
-            }
-        }
     }
+
     if (!found_target) {
+        last_status_ = RecorderStatus::kEpochNotFound;
         return false;
     }
     if (!any_chunks) {
         return true;
     }
     if (target_epoch < min_epoch) {
+        last_status_ = RecorderStatus::kEpochDropped;
         return false;
     }
 
@@ -855,13 +1290,25 @@ bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
         if (!record) {
             continue;
         }
-        if (!rewind_apply_epoch(*record,
-                d_regions_,
-                cfg_.region_capacity,
-                d_baseline_ptrs_,
-                d_ring_,
-                cfg_.ring_bytes,
-                stream)) {
+        if (record->epoch_id < min_valid_epoch_) {
+            continue;
+        }
+        if (record->chunk_count == 0 || record->reserved0 == 0u) {
+            continue;
+        }
+        uint32_t expected_generation = record->epoch_id / cfg_.epoch_capacity;
+        if (record->reserved1 != expected_generation) {
+            continue;
+        }
+        RecorderStatus status = rewind_apply_epoch(*record,
+            d_regions_,
+            cfg_.region_capacity,
+            d_baseline_ptrs_,
+            d_ring_,
+            cfg_.ring_bytes,
+            stream);
+        if (status != RecorderStatus::kOk) {
+            last_status_ = status;
             return false;
         }
     }
@@ -872,6 +1319,7 @@ bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
 bool Recorder::read_epochs_to_host(std::vector<EpochRecord>& out) {
     out.clear();
     if (!initialized_) {
+        last_status_ = RecorderStatus::kNotInitialized;
         return false;
     }
     out.resize(cfg_.epoch_capacity);
@@ -881,8 +1329,10 @@ bool Recorder::read_epochs_to_host(std::vector<EpochRecord>& out) {
         cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         out.clear();
+        last_status_ = RecorderStatus::kCudaError;
         return false;
     }
+    last_status_ = RecorderStatus::kOk;
     return true;
 }
 
