@@ -24,12 +24,15 @@ cmake --build build --config Release
 ```
 .\build\Release\tt_demo.exe
 .\build\Release\tt_demo_graph.exe
+.\build\Release\tt_demo_determinism.exe
 .\build\Release\tt_tests.exe
 ```
 
 Demo flags:
 - `--no-delta` disables delta capture (snapshots only).
 - `--ring-bytes=<n>` overrides ring size. If too small for all epochs, rewind verification is skipped.
+- `--deterministic` enables deterministic capture mode (see `docs/determinism.md`).
+- `--manifest-out=<path>` writes a deterministic manifest JSON.
 
 Graph + trace:
 - `tt_demo_graph` captures `(app work + capture_epoch)` as a CUDA Graph and replays it.
@@ -46,6 +49,19 @@ start chrome "chrome://tracing"
 `RecorderConfig` supports:
 - `retention_epochs`: keep the last N epochs (0 keeps all until space pressure).
 - `overwrite_mode`: `DROP_OLDEST` (discard old epochs to make space) or `BACKPRESSURE` (fail capture when space is insufficient).
+- `deterministic`: enforce deterministic capture ordering and prevent epoch drops.
+- `enable_manifest`: collect per-epoch region hashes for manifest output.
 
 Notes:
 - `ring_bytes` must be a multiple of 32 bytes.
+
+## Deterministic replay mode
+
+Use deterministic mode to ensure repeated runs generate identical per-epoch buffer hashes and manifest output:
+
+```
+.\build\Release\tt_demo.exe --deterministic --manifest-out=trace\tt_manifest.json
+.\build\Release\tt_demo_determinism.exe
+```
+
+See `docs/determinism.md` for the full contract and limitations.

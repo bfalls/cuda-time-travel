@@ -3,6 +3,11 @@
 #include <cstring>
 #include <vector>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <locale>
+#include <sstream>
 
 #include "tt/tt_layout.h"
 
@@ -21,6 +26,9 @@ static constexpr uint32_t kStampsPerEpoch = 3u;
 static constexpr uint32_t kStampEpochStart = 0u;
 static constexpr uint32_t kStampAfterRegions = 1u;
 static constexpr uint32_t kStampEpochEnd = 2u;
+static constexpr uint32_t kHashThreads = 256u;
+static constexpr uint64_t kHashOffset = 14695981039346656037ull;
+static constexpr uint64_t kHashPrime = 1099511628211ull;
 
 __host__ __device__ inline uint32_t align_up(uint32_t value) {
     return (value + (kRingAlignment - 1u)) & ~(kRingAlignment - 1u);
@@ -42,6 +50,45 @@ __global__ void stamp_kernel(uint64_t* stamps, const uint32_t* base, uint32_t of
             return;
         }
         stamps[base[0] + offset] = clock64();
+    }
+}
+
+__device__ inline uint64_t hash_mix(uint64_t hash, uint64_t value) {
+    hash ^= value;
+    hash *= kHashPrime;
+    return hash;
+}
+
+__global__ void hash_region_kernel(const uint8_t* data, uint32_t size_bytes, uint64_t* out_hash) {
+    __shared__ uint64_t partial[kHashThreads];
+    if (threadIdx.x >= kHashThreads) {
+        return;
+    }
+    if (!out_hash) {
+        return;
+    }
+    if (!data || size_bytes == 0u) {
+        if (threadIdx.x == 0) {
+            *out_hash = 0u;
+        }
+        return;
+    }
+
+    uint64_t local = 0u;
+    const uint32_t word_count = size_bytes / 4u;
+    const uint32_t* words = reinterpret_cast<const uint32_t*>(data);
+    for (uint32_t i = threadIdx.x; i < word_count; i += blockDim.x) {
+        local = hash_mix(local, static_cast<uint64_t>(words[i]));
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        uint64_t hash = kHashOffset;
+        for (uint32_t i = 0; i < kHashThreads; ++i) {
+            hash = hash_mix(hash, partial[i]);
+        }
+        *out_hash = hash;
     }
 }
 
@@ -662,6 +709,11 @@ bool Recorder::init(const RecorderConfig& cfg) {
     enable_graph_stamps_ = cfg.enable_graph_stamps;
     d_graph_stamps_ = cfg.graph_stamps;
     d_graph_stamp_counter_ = cfg.graph_stamp_counter;
+    deterministic_ = cfg.deterministic;
+    enable_manifest_ = cfg.enable_manifest;
+    deterministic_stream_ = nullptr;
+    deterministic_stream_set_ = false;
+    manifest_epochs_.clear();
 
     cudaError_t err = cudaSuccess;
     err = cudaMalloc(reinterpret_cast<void**>(&d_control_), sizeof(ControlBlock));
@@ -721,6 +773,13 @@ bool Recorder::init(const RecorderConfig& cfg) {
             return false;
         }
     }
+    if (enable_manifest_) {
+        err = cudaMalloc(reinterpret_cast<void**>(&d_region_hashes_), sizeof(uint64_t) * cfg_.region_capacity);
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
 
     ControlBlock host_control{};
     std::memset(&host_control, 0, sizeof(host_control));
@@ -728,7 +787,8 @@ bool Recorder::init(const RecorderConfig& cfg) {
     host_control.epoch_capacity = cfg_.epoch_capacity;
     host_control.region_capacity = cfg_.region_capacity;
     host_control.min_valid_epoch = 0u;
-    host_control.overwrite_mode = static_cast<uint32_t>(cfg_.overwrite_mode);
+    const OverwriteMode effective_overwrite = deterministic_ ? OverwriteMode::kBackpressure : cfg_.overwrite_mode;
+    host_control.overwrite_mode = static_cast<uint32_t>(effective_overwrite);
     host_control.retention_epochs = cfg_.retention_epochs;
 
     err = cudaMemcpy(d_control_, &host_control, sizeof(ControlBlock), cudaMemcpyHostToDevice);
@@ -789,6 +849,13 @@ bool Recorder::init(const RecorderConfig& cfg) {
             return false;
         }
     }
+    if (enable_manifest_ && d_region_hashes_) {
+        err = cudaMemset(d_region_hashes_, 0, sizeof(uint64_t) * cfg_.region_capacity);
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
 
     host_regions_.assign(cfg_.region_capacity, TrackedRegion{});
     initialized_ = true;
@@ -839,6 +906,10 @@ void Recorder::shutdown() {
         cudaFree(d_stamp_base_);
         d_stamp_base_ = nullptr;
     }
+    if (d_region_hashes_) {
+        cudaFree(d_region_hashes_);
+        d_region_hashes_ = nullptr;
+    }
     if (d_regions_) {
         cudaFree(d_regions_);
         d_regions_ = nullptr;
@@ -858,9 +929,14 @@ void Recorder::shutdown() {
     initialized_ = false;
     cfg_ = RecorderConfig{};
     host_regions_.clear();
+    manifest_epochs_.clear();
     min_valid_epoch_ = 0u;
     last_status_ = RecorderStatus::kOk;
     enable_graph_stamps_ = false;
+    deterministic_ = false;
+    enable_manifest_ = false;
+    deterministic_stream_ = nullptr;
+    deterministic_stream_set_ = false;
     d_graph_stamps_ = nullptr;
     d_graph_stamp_counter_ = nullptr;
 }
@@ -990,6 +1066,15 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         last_status_ = RecorderStatus::kNotInitialized;
         return false;
     }
+    if (deterministic_) {
+        if (!deterministic_stream_set_) {
+            deterministic_stream_ = stream;
+            deterministic_stream_set_ = true;
+        } else if (stream != deterministic_stream_) {
+            last_status_ = RecorderStatus::kDeterminismViolation;
+            return false;
+        }
+    }
 
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
@@ -999,6 +1084,10 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     }
 
     if (capture_status != cudaStreamCaptureStatusNone) {
+        if (enable_manifest_) {
+            last_status_ = RecorderStatus::kInvalidConfig;
+            return false;
+        }
         uint32_t enabled_count = 0;
         for (uint32_t i = 0; i < cfg_.region_capacity; ++i) {
             const TrackedRegion& region = host_regions_[i];
@@ -1313,7 +1402,8 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         return true;
     };
 
-    if (cfg_.overwrite_mode == OverwriteMode::kBackpressure) {
+    const OverwriteMode effective_overwrite = deterministic_ ? OverwriteMode::kBackpressure : cfg_.overwrite_mode;
+    if (effective_overwrite == OverwriteMode::kBackpressure) {
         if (cfg_.retention_epochs > 0 && valid_epochs.size() >= cfg_.retention_epochs) {
             last_status_ = RecorderStatus::kBackpressure;
             return false;
@@ -1346,7 +1436,7 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         return false;
     }
 
-    if (cfg_.overwrite_mode == OverwriteMode::kBackpressure) {
+    if (effective_overwrite == OverwriteMode::kBackpressure) {
         if (estimated_bytes > (cfg_.ring_bytes - used_bytes)) {
             last_status_ = RecorderStatus::kBackpressure;
             return false;
@@ -1461,6 +1551,35 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         }
     }
 
+    std::vector<uint64_t> host_hashes;
+    if (enable_manifest_) {
+        host_hashes.assign(cfg_.region_capacity, 0u);
+        err = cudaMemsetAsync(d_region_hashes_, 0, sizeof(uint64_t) * cfg_.region_capacity, stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+        for (const PendingChunk& chunk : pending) {
+            const TrackedRegion& region = host_regions_[chunk.region_index];
+            const uint8_t* region_ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(region.base_ptr));
+            hash_region_kernel<<<1, kHashThreads, 0, stream>>>(region_ptr, region.size_bytes, d_region_hashes_ + region.region_id);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
+        err = cudaMemcpyAsync(host_hashes.data(),
+            d_region_hashes_,
+            sizeof(uint64_t) * cfg_.region_capacity,
+            cudaMemcpyDeviceToHost,
+            stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
+
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
@@ -1497,6 +1616,25 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
         return false;
+    }
+
+    if (enable_manifest_) {
+        ManifestEpoch manifest_epoch{};
+        manifest_epoch.epoch_id = host_begin.epoch_id;
+        manifest_epoch.ring_bytes_written = static_cast<uint32_t>(epoch_bytes);
+        manifest_epoch.regions.reserve(pending.size());
+        for (const PendingChunk& chunk : pending) {
+            const TrackedRegion& region = host_regions_[chunk.region_index];
+            ManifestRegion manifest_region{};
+            manifest_region.region_id = region.region_id;
+            manifest_region.size_bytes = region.size_bytes;
+            manifest_region.hash64 = host_hashes[region.region_id];
+            manifest_region.payload_bytes = chunk.payload_bytes;
+            manifest_region.uncompressed_bytes = region.size_bytes;
+            manifest_region.snapshot = (chunk.chunk_type == kChunkTypeSnapshot);
+            manifest_epoch.regions.push_back(manifest_region);
+        }
+        manifest_epochs_.push_back(std::move(manifest_epoch));
     }
 
     return true;
@@ -1611,6 +1749,69 @@ bool Recorder::read_epochs_to_host(std::vector<EpochRecord>& out) {
     }
     last_status_ = RecorderStatus::kOk;
     return true;
+}
+
+bool Recorder::write_manifest_json(const char* path) const {
+    if (!path || !enable_manifest_) {
+        return false;
+    }
+
+    std::filesystem::path out_path(path);
+    if (out_path.has_parent_path()) {
+        std::filesystem::create_directories(out_path.parent_path());
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+
+    out.imbue(std::locale::classic());
+    out << "{ \"epochs\": [";
+    for (size_t i = 0; i < manifest_epochs_.size(); ++i) {
+        const ManifestEpoch& epoch = manifest_epochs_[i];
+        if (i > 0) {
+            out << ",";
+        }
+        out << "{";
+        out << "\"epoch_id\":" << epoch.epoch_id;
+        out << ",\"ring_bytes_written\":" << epoch.ring_bytes_written;
+        out << ",\"regions\":[";
+        for (size_t r = 0; r < epoch.regions.size(); ++r) {
+            const ManifestRegion& region = epoch.regions[r];
+            if (r > 0) {
+                out << ",";
+            }
+            std::ostringstream hash_stream;
+            hash_stream.imbue(std::locale::classic());
+            hash_stream << "0x" << std::hex << std::setw(16) << std::setfill('0') << region.hash64;
+
+            double ratio = 0.0;
+            if (region.uncompressed_bytes > 0 && region.payload_bytes > 0) {
+                ratio = static_cast<double>(region.payload_bytes) / static_cast<double>(region.uncompressed_bytes);
+            }
+            std::ostringstream ratio_stream;
+            ratio_stream.imbue(std::locale::classic());
+            ratio_stream << std::fixed << std::setprecision(6) << ratio;
+
+            out << "{";
+            out << "\"region_id\":" << region.region_id;
+            out << ",\"size_bytes\":" << region.size_bytes;
+            out << ",\"hash64\":\"" << hash_stream.str() << "\"";
+            out << ",\"snapshot_or_delta\":\"" << (region.snapshot ? "snapshot" : "delta") << "\"";
+            out << ",\"payload_bytes\":" << region.payload_bytes;
+            out << ",\"uncompressed_bytes\":" << region.uncompressed_bytes;
+            out << ",\"compression_ratio\":" << ratio_stream.str();
+            out << "}";
+        }
+        out << "]}";
+    }
+    out << "] }";
+    return true;
+}
+
+void Recorder::clear_manifest() {
+    manifest_epochs_.clear();
 }
 
 } // namespace tt
