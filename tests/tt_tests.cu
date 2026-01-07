@@ -1425,6 +1425,290 @@ bool test_deterministic_manifest_match() {
     return manifest_a == manifest_b;
 }
 
+bool run_verify_capture(tt::Recorder& recorder,
+    uint32_t epoch_count,
+    uint32_t* d_buffer,
+    uint32_t* d_epoch_counter,
+    uint32_t element_count) {
+    const uint32_t threads = 256;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        set_epoch_kernel<<<1, 1>>>(d_epoch_counter, epoch);
+        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_epoch_counter);
+        if (!recorder.capture_epoch(0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool test_verify_manifest_pass() {
+    const uint32_t element_count = 1024;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 5;
+    const char* manifest_path = "trace/tt_manifest_verify_pass.json";
+
+    uint32_t* d_buffer = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify counter")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = true;
+    cfg.enable_manifest = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.write_manifest_json(manifest_path)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::VerifyOptions options{};
+    tt::VerifyReport report{};
+    bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
+
+    recorder.shutdown();
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer);
+
+    if (!ok || report.status != "pass") {
+        std::printf("verify pass status=%s error=%s\n", report.status.c_str(), report.error.c_str());
+    }
+    return ok && report.status == "pass";
+}
+
+bool test_verify_manifest_mismatch_localize() {
+    const uint32_t element_count = 512;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 4;
+    const char* manifest_path = "trace/tt_manifest_verify_fail.json";
+
+    uint32_t* d_buffer = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify fail buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify fail counter")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = true;
+    cfg.enable_manifest = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.write_manifest_json(manifest_path)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::VerifyOptions options{};
+    options.tamper.enabled = true;
+    options.tamper.epoch_id = 2;
+    options.tamper.region_id = 0;
+    options.tamper.byte_offset = 8;
+    options.tamper.xor_mask = 0x1;
+
+    tt::VerifyReport report{};
+    bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
+
+    recorder.shutdown();
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer);
+
+    return !ok && report.status == "fail" && report.has_mismatch &&
+        report.first_mismatch.localized && report.first_mismatch.first_diff_offset_bytes == options.tamper.byte_offset;
+}
+
+bool test_verify_manifest_dropped_epochs_error() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 5;
+    const char* manifest_path = "trace/tt_manifest_verify_drop.json";
+
+    uint32_t* d_buffer = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify drop buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify drop counter")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 2;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = false;
+    cfg.enable_manifest = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.write_manifest_json(manifest_path)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::VerifyOptions options{};
+    tt::VerifyReport report{};
+    bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
+
+    recorder.shutdown();
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer);
+
+    return !ok && report.status == "error";
+}
+
+bool test_verify_manifest_subset() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 5;
+    const char* manifest_path = "trace/tt_manifest_verify_subset.json";
+
+    uint32_t* d_buffer = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify subset buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify subset counter")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = true;
+    cfg.enable_manifest = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.write_manifest_json(manifest_path)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::VerifyOptions options{};
+    options.epoch_range_set = true;
+    options.epoch_begin = 1;
+    options.epoch_end = 3;
+    options.region_ids.push_back(0);
+
+    tt::VerifyReport report{};
+    bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
+
+    recorder.shutdown();
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer);
+
+    return ok && report.status == "pass";
+}
+
 bool test_deterministic_rewind() {
     const uint32_t element_count = 512;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
@@ -1959,6 +2243,30 @@ int main() {
     bool ok_manifest = test_deterministic_manifest_match();
     if (!ok_manifest) {
         std::printf("test_deterministic_manifest_match failed\n");
+        return 1;
+    }
+
+    bool ok_verify_pass = test_verify_manifest_pass();
+    if (!ok_verify_pass) {
+        std::printf("test_verify_manifest_pass failed\n");
+        return 1;
+    }
+
+    bool ok_verify_fail = test_verify_manifest_mismatch_localize();
+    if (!ok_verify_fail) {
+        std::printf("test_verify_manifest_mismatch_localize failed\n");
+        return 1;
+    }
+
+    bool ok_verify_drop = test_verify_manifest_dropped_epochs_error();
+    if (!ok_verify_drop) {
+        std::printf("test_verify_manifest_dropped_epochs_error failed\n");
+        return 1;
+    }
+
+    bool ok_verify_subset = test_verify_manifest_subset();
+    if (!ok_verify_subset) {
+        std::printf("test_verify_manifest_subset failed\n");
         return 1;
     }
 

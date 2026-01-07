@@ -24,9 +24,11 @@ cmake --build build --config Release
 
 ```
 .\build\Release\tt_demo.exe
+.\build\Release\tt.exe verify --manifest trace\tt_manifest_verify_demo.json
 .\build\Release\tt_demo_graph.exe
 .\build\Release\tt_demo_graph_patch.exe
 .\build\Release\tt_demo_determinism.exe
+.\build\Release\tt_demo_verify.exe
 .\build\Release\tt_demo_multistream_stress.exe --deps
 .\build\Release\tt_demo_multistream_stress.exe --no-deps
 .\build\Release\tt_tests.exe
@@ -87,3 +89,13 @@ Use deterministic mode to ensure repeated runs generate identical per-epoch buff
 ```
 
 See `docs/determinism.md` for the full contract and limitations.
+
+## Verification
+
+Verify a recorded run against a manifest and localize mismatches:
+
+```
+.\build\Release\tt.exe verify --manifest trace\tt_manifest_verify_demo.json --trace-annotate
+```
+
+See `docs/verify.md` for workflow details, limitations, and additional flags.
