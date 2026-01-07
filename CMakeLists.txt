@@ -50,6 +50,12 @@ add_executable(tt_demo_determinism
 
 target_link_libraries(tt_demo_determinism PRIVATE ttrecorder)
 
+add_executable(tt_demo_graph_patch
+    demo/tt_demo_graph_patch.cu
+)
+
+target_link_libraries(tt_demo_graph_patch PRIVATE ttrecorder)
+
 add_executable(tt_tests
     tests/tt_tests.cu
 )

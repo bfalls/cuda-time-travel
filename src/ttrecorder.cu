@@ -9,6 +9,7 @@
 #include <locale>
 #include <sstream>
 
+#include "tt/tt_graph.h"
 #include "tt/tt_layout.h"
 
 namespace tt {
@@ -30,6 +31,40 @@ static constexpr uint32_t kHashThreads = 256u;
 static constexpr uint64_t kHashOffset = 14695981039346656037ull;
 static constexpr uint64_t kHashPrime = 1099511628211ull;
 
+__device__ inline bool graph_control_stamps_enabled(const RecorderGraphControl* control) {
+    if (!control) {
+        return true;
+    }
+    return (control->flags & kGraphControlStampsEnabled) != 0u;
+}
+
+__device__ inline bool graph_control_region_enabled(const RecorderGraphControl* control, uint32_t region_id) {
+    if (!control) {
+        return true;
+    }
+    if (control->region_bitmap && control->bitmap_words > 0u) {
+        const uint32_t word = region_id / 32u;
+        if (word >= control->bitmap_words) {
+            return true;
+        }
+        const uint32_t bit = region_id % 32u;
+        const uint32_t mask = 1u << bit;
+        return (control->region_bitmap[word] & mask) != 0u;
+    }
+    if (region_id >= 64u) {
+        return true;
+    }
+    const uint64_t mask = 1ull << region_id;
+    return (control->region_mask & mask) != 0ull;
+}
+
+__device__ inline bool graph_control_snapshot_allowed(const RecorderGraphControl* control, uint32_t epoch_id) {
+    if (!control || control->snapshot_period == 0u) {
+        return true;
+    }
+    return (epoch_id % control->snapshot_period) == 0u;
+}
+
 __host__ __device__ inline uint32_t align_up(uint32_t value) {
     return (value + (kRingAlignment - 1u)) & ~(kRingAlignment - 1u);
 }
@@ -44,8 +79,39 @@ __global__ void reserve_stamp_range_kernel(uint32_t* counter, uint32_t* out_base
     }
 }
 
+__global__ void reserve_stamp_range_controlled_kernel(const RecorderGraphControl* control,
+    uint32_t* counter,
+    uint32_t* out_base,
+    uint32_t count) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (!graph_control_stamps_enabled(control)) {
+            return;
+        }
+        if (!counter || !out_base) {
+            return;
+        }
+        const uint32_t base = atomicAdd(counter, count);
+        *out_base = base;
+    }
+}
+
 __global__ void stamp_kernel(uint64_t* stamps, const uint32_t* base, uint32_t offset) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (!stamps || !base) {
+            return;
+        }
+        stamps[base[0] + offset] = clock64();
+    }
+}
+
+__global__ void stamp_controlled_kernel(const RecorderGraphControl* control,
+    uint64_t* stamps,
+    const uint32_t* base,
+    uint32_t offset) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (!graph_control_stamps_enabled(control)) {
+            return;
+        }
         if (!stamps || !base) {
             return;
         }
@@ -216,13 +282,21 @@ __global__ void snapshot_region_graph_kernel(ControlBlock* control,
     uint8_t* ring,
     uint32_t ring_bytes,
     const DeviceEpochBegin* begin,
+    const RecorderGraphControl* graph_control,
     uint32_t* first_ring_offset,
-    uint32_t* first_was_written) {
+    uint32_t* first_was_written,
+    uint32_t* enabled_count) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         if (!begin) {
             return;
         }
         if ((region->options & 1u) == 0u || region->size_bytes == 0) {
+            return;
+        }
+        if (!graph_control_snapshot_allowed(graph_control, begin->epoch_id)) {
+            return;
+        }
+        if (!graph_control_region_enabled(graph_control, region->region_id)) {
             return;
         }
 
@@ -266,6 +340,9 @@ __global__ void snapshot_region_graph_kernel(ControlBlock* control,
                     baseline_words[i] = src_words[i];
                 }
             }
+        }
+        if (enabled_count) {
+            atomicAdd(enabled_count, 1u);
         }
     }
 }
@@ -419,20 +496,24 @@ __global__ void finalize_epoch_kernel(ControlBlock* control,
     const DeviceEpochBegin* begin,
     EpochRecord* epochs,
     uint32_t epoch_capacity,
-    uint32_t enabled_count,
+    const uint32_t* enabled_count,
     const uint32_t* first_ring_offset) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         if (!begin || !epochs || epoch_capacity == 0u) {
             return;
         }
 
+        uint32_t enabled = 0u;
+        if (enabled_count) {
+            enabled = *enabled_count;
+        }
         uint64_t epoch_bytes = control->write_pos - begin->write_pos_before;
         EpochRecord record{};
         record.epoch_id = begin->epoch_id;
-        record.chunk_count = enabled_count;
-        record.region_count = enabled_count;
+        record.chunk_count = enabled;
+        record.region_count = enabled;
         record.reserved0 = (epoch_bytes > UINT32_MAX) ? 0u : static_cast<uint32_t>(epoch_bytes);
-        record.ring_offset = (enabled_count > 0u && first_ring_offset) ? *first_ring_offset : 0u;
+        record.ring_offset = (enabled > 0u && first_ring_offset) ? *first_ring_offset : 0u;
         record.reserved1 = begin->epoch_id / epoch_capacity;
         record.timestamp = 0;
         const uint32_t index = begin->epoch_index_pos % epoch_capacity;
@@ -680,6 +761,18 @@ RecorderStatus rewind_apply_epoch(const EpochRecord& record,
     return RecorderStatus::kOk;
 }
 
+struct GraphKernelTagRegistrar {
+    GraphKernelTagRegistrar() {
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(begin_epoch_kernel), "tt.begin_epoch");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(snapshot_region_graph_kernel), "tt.snapshot_region_graph");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(finalize_epoch_kernel), "tt.finalize_epoch");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(stamp_controlled_kernel), "tt.graph_stamp");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(reserve_stamp_range_controlled_kernel), "tt.graph_stamp_reserve");
+    }
+};
+
+static GraphKernelTagRegistrar kGraphKernelTagRegistrar;
+
 } // namespace
 
 bool Recorder::init(const RecorderConfig& cfg) {
@@ -780,6 +873,24 @@ bool Recorder::init(const RecorderConfig& cfg) {
             return false;
         }
     }
+    err = cudaMalloc(reinterpret_cast<void**>(&d_graph_control_), sizeof(RecorderGraphControl));
+    if (err != cudaSuccess) {
+        shutdown();
+        return false;
+    }
+    err = cudaMalloc(reinterpret_cast<void**>(&d_enabled_count_), sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        shutdown();
+        return false;
+    }
+    if (cfg_.region_capacity > 64u) {
+        const uint32_t words = (cfg_.region_capacity + 31u) / 32u;
+        err = cudaMalloc(reinterpret_cast<void**>(&d_region_enable_bitmap_), sizeof(uint32_t) * words);
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
 
     ControlBlock host_control{};
     std::memset(&host_control, 0, sizeof(host_control));
@@ -856,6 +967,37 @@ bool Recorder::init(const RecorderConfig& cfg) {
             return false;
         }
     }
+    if (d_enabled_count_) {
+        err = cudaMemset(d_enabled_count_, 0, sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
+    if (d_region_enable_bitmap_) {
+        const uint32_t words = (cfg_.region_capacity + 31u) / 32u;
+        err = cudaMemset(d_region_enable_bitmap_, 0xFF, sizeof(uint32_t) * words);
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
+
+    graph_control_host_ = RecorderGraphControl{};
+    if (cfg_.region_capacity >= 64u) {
+        graph_control_host_.region_mask = ~0ull;
+    } else {
+        graph_control_host_.region_mask = (1ull << cfg_.region_capacity) - 1ull;
+    }
+    graph_control_host_.snapshot_period = 0;
+    graph_control_host_.flags = enable_graph_stamps_ ? kGraphControlStampsEnabled : 0u;
+    graph_control_host_.region_bitmap = d_region_enable_bitmap_;
+    graph_control_host_.bitmap_words = d_region_enable_bitmap_ ? (cfg_.region_capacity + 31u) / 32u : 0u;
+    err = cudaMemcpy(d_graph_control_, &graph_control_host_, sizeof(RecorderGraphControl), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        shutdown();
+        return false;
+    }
 
     host_regions_.assign(cfg_.region_capacity, TrackedRegion{});
     initialized_ = true;
@@ -910,6 +1052,18 @@ void Recorder::shutdown() {
         cudaFree(d_region_hashes_);
         d_region_hashes_ = nullptr;
     }
+    if (d_enabled_count_) {
+        cudaFree(d_enabled_count_);
+        d_enabled_count_ = nullptr;
+    }
+    if (d_graph_control_) {
+        cudaFree(d_graph_control_);
+        d_graph_control_ = nullptr;
+    }
+    if (d_region_enable_bitmap_) {
+        cudaFree(d_region_enable_bitmap_);
+        d_region_enable_bitmap_ = nullptr;
+    }
     if (d_regions_) {
         cudaFree(d_regions_);
         d_regions_ = nullptr;
@@ -939,6 +1093,7 @@ void Recorder::shutdown() {
     deterministic_stream_set_ = false;
     d_graph_stamps_ = nullptr;
     d_graph_stamp_counter_ = nullptr;
+    graph_control_host_ = RecorderGraphControl{};
 }
 
 bool Recorder::register_region(uint32_t region_id, void* device_ptr, uint32_t size_bytes, uint32_t options) {
@@ -1060,6 +1215,76 @@ bool Recorder::set_region_full_snapshot_period(uint32_t region_id, uint32_t peri
     return true;
 }
 
+bool Recorder::update_graph_control(const RecorderGraphControl& control, cudaStream_t stream) {
+    if (!initialized_ || !d_graph_control_) {
+        return false;
+    }
+    graph_control_host_ = control;
+    if (!enable_graph_stamps_) {
+        graph_control_host_.flags &= ~kGraphControlStampsEnabled;
+    }
+    if (d_region_enable_bitmap_) {
+        graph_control_host_.region_bitmap = d_region_enable_bitmap_;
+        graph_control_host_.bitmap_words = (cfg_.region_capacity + 31u) / 32u;
+    } else {
+        graph_control_host_.region_bitmap = nullptr;
+        graph_control_host_.bitmap_words = 0u;
+    }
+    cudaError_t err = cudaMemcpyAsync(d_graph_control_,
+        &graph_control_host_,
+        sizeof(RecorderGraphControl),
+        cudaMemcpyHostToDevice,
+        stream);
+    return err == cudaSuccess;
+}
+
+bool Recorder::update_region_enable_bitmap(const uint32_t* bitmap, uint32_t words, cudaStream_t stream) {
+    if (!initialized_ || !d_region_enable_bitmap_ || !bitmap || words == 0u) {
+        return false;
+    }
+    const uint32_t expected_words = (cfg_.region_capacity + 31u) / 32u;
+    if (words > expected_words) {
+        return false;
+    }
+    cudaError_t err = cudaMemcpyAsync(d_region_enable_bitmap_,
+        bitmap,
+        sizeof(uint32_t) * words,
+        cudaMemcpyHostToDevice,
+        stream);
+    if (err != cudaSuccess) {
+        return false;
+    }
+    graph_control_host_.region_bitmap = d_region_enable_bitmap_;
+    graph_control_host_.bitmap_words = words;
+    err = cudaMemcpyAsync(d_graph_control_,
+        &graph_control_host_,
+        sizeof(RecorderGraphControl),
+        cudaMemcpyHostToDevice,
+        stream);
+    return err == cudaSuccess;
+}
+
+bool Recorder::update_region_pointer(uint32_t region_id, void* device_ptr) {
+    if (!initialized_) {
+        return false;
+    }
+    if (region_id >= cfg_.region_capacity) {
+        return false;
+    }
+    if (!device_ptr) {
+        return false;
+    }
+    TrackedRegion host_region = host_regions_[region_id];
+    host_region.base_ptr = reinterpret_cast<uint64_t>(device_ptr);
+    host_regions_[region_id] = host_region;
+    const size_t offset_bytes = sizeof(TrackedRegion) * static_cast<size_t>(region_id);
+    cudaError_t err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_regions_) + offset_bytes,
+        &host_region,
+        sizeof(TrackedRegion),
+        cudaMemcpyHostToDevice);
+    return err == cudaSuccess;
+}
+
 bool Recorder::capture_epoch(cudaStream_t stream) {
     last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
@@ -1088,24 +1313,17 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             last_status_ = RecorderStatus::kInvalidConfig;
             return false;
         }
-        uint32_t enabled_count = 0;
-        for (uint32_t i = 0; i < cfg_.region_capacity; ++i) {
-            const TrackedRegion& region = host_regions_[i];
-            if ((region.options & 1u) == 0u) {
-                continue;
-            }
-            if (region.size_bytes == 0u || region.base_ptr == 0u) {
-                continue;
-            }
-            ++enabled_count;
-        }
-
         err = cudaMemsetAsync(d_first_ring_offset_, 0, sizeof(uint32_t), stream);
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
             return false;
         }
         err = cudaMemsetAsync(d_first_was_written_, 0, sizeof(uint32_t), stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+        err = cudaMemsetAsync(d_enabled_count_, 0, sizeof(uint32_t), stream);
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
             return false;
@@ -1118,13 +1336,21 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             return false;
         }
         if (enable_graph_stamps_) {
-            reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_graph_stamp_counter_, d_stamp_base_, kStampsPerEpoch);
+            reserve_stamp_range_controlled_kernel<<<1, 1, 0, stream>>>(
+                d_graph_control_,
+                d_graph_stamp_counter_,
+                d_stamp_base_,
+                kStampsPerEpoch);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
                 return false;
             }
-            stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampEpochStart);
+            stamp_controlled_kernel<<<1, 1, 0, stream>>>(
+                d_graph_control_,
+                d_graph_stamps_,
+                d_stamp_base_,
+                kStampEpochStart);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1148,8 +1374,10 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
                 d_ring_,
                 cfg_.ring_bytes,
                 d_epoch_begin_,
+                d_graph_control_,
                 d_first_ring_offset_,
-                d_first_was_written_);
+                d_first_was_written_,
+                d_enabled_count_);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1157,7 +1385,11 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             }
         }
         if (enable_graph_stamps_) {
-            stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampAfterRegions);
+            stamp_controlled_kernel<<<1, 1, 0, stream>>>(
+                d_graph_control_,
+                d_graph_stamps_,
+                d_stamp_base_,
+                kStampAfterRegions);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1170,7 +1402,7 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             d_epoch_begin_,
             d_epochs_,
             cfg_.epoch_capacity,
-            enabled_count,
+            d_enabled_count_,
             d_first_ring_offset_);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
@@ -1178,7 +1410,11 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             return false;
         }
         if (enable_graph_stamps_) {
-            stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampEpochEnd);
+            stamp_controlled_kernel<<<1, 1, 0, stream>>>(
+                d_graph_control_,
+                d_graph_stamps_,
+                d_stamp_base_,
+                kStampEpochEnd);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;

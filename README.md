@@ -1,4 +1,5 @@
 # cuda-time-travel
+Record and rewind CUDA GPU memory state with low overhead, deterministic replay, and Chrome trace export (CUPTI kernel timeline + graph-aware stamps).
 
 ## v1 scope and limitations
 
@@ -24,6 +25,7 @@ cmake --build build --config Release
 ```
 .\build\Release\tt_demo.exe
 .\build\Release\tt_demo_graph.exe
+.\build\Release\tt_demo_graph_patch.exe
 .\build\Release\tt_demo_determinism.exe
 .\build\Release\tt_tests.exe
 ```
@@ -38,6 +40,11 @@ Graph + trace:
 - `tt_demo_graph` captures `(app work + capture_epoch)` as a CUDA Graph and replays it.
 - Chrome trace output is written to `trace/tt_trace.json`.
 - See `docs/graphs.md` and `docs/trace.md` for usage and limitations.
+
+CUDA Graph patching:
+- `tt_demo_graph_patch` replays a captured graph and updates per-iteration parameters and recorder controls without rebuilding.
+- Example: `.\build\Release\tt_demo_graph_patch.exe --iterations=12 --toggle-every=3`
+- Use `--kernel-patch` to exercise kernel node param updates (falls back to recapture if needed).
 
 Open trace in Chrome:
 ```

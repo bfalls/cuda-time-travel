@@ -1,4 +1,5 @@
 #include "tt/tt_graph.h"
+#include "tt/tt_graph_patch.h"
 #include "tt/tt_cupti.h"
 #include "tt/tt_trace.h"
 #include "tt/ttrecorder.h"
@@ -30,6 +31,23 @@ __global__ void write_pattern_kernel(uint32_t* data, uint32_t count, const uint3
     if (idx < count) {
         const uint32_t epoch = *counter;
         data[idx] = epoch ^ (idx * 2654435761u);
+    }
+}
+
+__global__ void write_pattern_iter_kernel(uint32_t* data, uint32_t count, const tt::IterParams* params) {
+    const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < count && params) {
+        const uint32_t mix = (idx * 2654435761u) ^ params->seed;
+        const uint32_t value = params->epoch ^ mix;
+        data[idx] = (params->flags & 1u) ? ~value : value;
+    }
+}
+
+__global__ void write_pattern_patch_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+    const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx < count) {
+        const uint32_t mix = (idx * 2654435761u) ^ seed;
+        data[idx] = epoch ^ mix;
     }
 }
 
@@ -74,6 +92,18 @@ bool verify_pattern(const std::vector<uint32_t>& data, uint32_t seed) {
     for (size_t i = 0; i < data.size(); ++i) {
         uint32_t expected = seed ^ static_cast<uint32_t>(i * 2654435761u);
         if (data[i] != expected) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool verify_pattern_params(const std::vector<uint32_t>& data, uint32_t epoch, uint32_t seed, uint32_t flags) {
+    for (size_t i = 0; i < data.size(); ++i) {
+        const uint32_t mix = (static_cast<uint32_t>(i) * 2654435761u) ^ seed;
+        const uint32_t expected = epoch ^ mix;
+        const uint32_t value = (flags & 1u) ? ~expected : expected;
+        if (data[i] != value) {
             return false;
         }
     }
@@ -894,6 +924,375 @@ bool test_graph_capture_and_trace() {
     return valid_trace;
 }
 
+bool test_graph_iter_params_update() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+
+    uint32_t* d_buffer = nullptr;
+    tt::IterParams* d_params = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc iter buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_params, sizeof(tt::IterParams)), "cudaMalloc iter params")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    cudaStream_t stream = nullptr;
+    if (!check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate iter params")) {
+        cudaFree(d_params);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::GraphSession graph;
+    if (!graph.begin_capture(stream)) {
+        cudaStreamDestroy(stream);
+        cudaFree(d_params);
+        cudaFree(d_buffer);
+        return false;
+    }
+    const uint32_t threads = 256;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    write_pattern_iter_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, d_params);
+    if (!graph.end_capture()) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_params);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    for (uint32_t epoch = 0; epoch < 3; ++epoch) {
+        tt::IterParams host_params{};
+        host_params.epoch = epoch;
+        host_params.seed = 0x55u + epoch;
+        host_params.flags = epoch & 1u;
+        if (!check_cuda(cudaMemcpyAsync(d_params,
+                &host_params,
+                sizeof(tt::IterParams),
+                cudaMemcpyHostToDevice,
+                stream),
+                "memcpy iter params test")) {
+            graph.destroy();
+            cudaStreamDestroy(stream);
+            cudaFree(d_params);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!graph.launch(stream)) {
+            graph.destroy();
+            cudaStreamDestroy(stream);
+            cudaFree(d_params);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaStreamSynchronize(stream), "iter params sync")) {
+            graph.destroy();
+            cudaStreamDestroy(stream);
+            cudaFree(d_params);
+            cudaFree(d_buffer);
+            return false;
+        }
+        std::vector<uint32_t> host_out(element_count);
+        if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy iter out")) {
+            graph.destroy();
+            cudaStreamDestroy(stream);
+            cudaFree(d_params);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!verify_pattern_params(host_out, host_params.epoch, host_params.seed, host_params.flags)) {
+            graph.destroy();
+            cudaStreamDestroy(stream);
+            cudaFree(d_params);
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    graph.destroy();
+    cudaStreamDestroy(stream);
+    cudaFree(d_params);
+    cudaFree(d_buffer);
+    return true;
+}
+
+bool test_graph_kernel_param_patch() {
+    tt::RegisterGraphKernelTag(reinterpret_cast<const void*>(write_pattern_patch_kernel), "test.write_pattern_patch");
+
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+
+    uint32_t* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc patch buffer")) {
+        return false;
+    }
+
+    cudaStream_t stream = nullptr;
+    if (!check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate patch")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::GraphSession graph;
+    if (!graph.begin_capture(stream)) {
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    const uint32_t threads = 256;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    write_pattern_patch_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, 0u, 0u);
+    if (!graph.end_capture()) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    uint32_t node_id = UINT32_MAX;
+    for (const auto& node : graph.get_nodes()) {
+        if (node.name == "test.write_pattern_patch") {
+            node_id = node.id;
+            break;
+        }
+    }
+    if (node_id == UINT32_MAX) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    cudaKernelNodeParams params{};
+    if (!graph.get_kernel_node_params(node_id, &params)) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    uint32_t epoch = 2;
+    uint32_t seed = 0x44u;
+    uint32_t element_count_value = element_count;
+    void* kernel_args[] = {&d_buffer, &element_count_value, &epoch, &seed};
+    params.kernelParams = kernel_args;
+    tt::GraphUpdateStatus status{};
+    if (!graph.update_kernel_node_params(node_id, params, &status)) {
+        std::printf("test_graph_kernel_param_patch skipped: %s (%s)\n",
+            tt::GraphUpdateReasonString(status.reason),
+            cudaGetErrorString(status.cuda_error));
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return status.reason == tt::GraphUpdateReason::kGraphUpdateNotSupported;
+    }
+
+    if (!graph.launch(stream) || !check_cuda(cudaStreamSynchronize(stream), "patch sync 1")) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    std::vector<uint32_t> host_out(element_count);
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy patch out 1")) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!verify_pattern_params(host_out, epoch, seed, 0u)) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    epoch = 5;
+    seed = 0x99u;
+    void* kernel_args2[] = {&d_buffer, &element_count_value, &epoch, &seed};
+    params.kernelParams = kernel_args2;
+    if (!graph.update_kernel_node_params(node_id, params, &status)) {
+        std::printf("test_graph_kernel_param_patch skipped: %s (%s)\n",
+            tt::GraphUpdateReasonString(status.reason),
+            cudaGetErrorString(status.cuda_error));
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return status.reason == tt::GraphUpdateReason::kGraphUpdateNotSupported;
+    }
+    if (!graph.launch(stream) || !check_cuda(cudaStreamSynchronize(stream), "patch sync 2")) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy patch out 2")) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!verify_pattern_params(host_out, epoch, seed, 0u)) {
+        graph.destroy();
+        cudaStreamDestroy(stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    graph.destroy();
+    cudaStreamDestroy(stream);
+    cudaFree(d_buffer);
+    return true;
+}
+
+bool test_graph_control_updates() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 6;
+    const uint32_t stamps_per_epoch = 3;
+
+    uint32_t* d_buffer_a = nullptr;
+    uint32_t* d_buffer_b = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    uint64_t* d_stamps = nullptr;
+    uint32_t* d_stamp_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer_a, size_bytes), "cudaMalloc ctrl buffer A") ||
+        !check_cuda(cudaMalloc(&d_buffer_b, size_bytes), "cudaMalloc ctrl buffer B") ||
+        !check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc ctrl epoch") ||
+        !check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * epoch_count * stamps_per_epoch), "cudaMalloc ctrl stamps") ||
+        !check_cuda(cudaMalloc(&d_stamp_counter, sizeof(uint32_t)), "cudaMalloc ctrl stamp counter")) {
+        return false;
+    }
+    if (!check_cuda(cudaMemset(d_stamp_counter, 0, sizeof(uint32_t)), "memset ctrl stamp counter")) {
+        return false;
+    }
+
+    cudaStream_t stream = nullptr;
+    if (!check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate ctrl")) {
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.enable_graph_stamps = true;
+    cfg.graph_stamps = d_stamps;
+    cfg.graph_stamp_counter = d_stamp_counter;
+    if (!recorder.init(cfg)) {
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer_a, size_bytes, 1) ||
+        !recorder.register_region(1, d_buffer_b, size_bytes, 1)) {
+        recorder.shutdown();
+        return false;
+    }
+
+    tt::GraphSession graph;
+    if (!graph.begin_capture(stream)) {
+        recorder.shutdown();
+        return false;
+    }
+    const uint32_t threads = 256;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_a, element_count, d_epoch_counter);
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_b, element_count, d_epoch_counter);
+    if (!recorder.capture_epoch(stream)) {
+        graph.destroy();
+        recorder.shutdown();
+        return false;
+    }
+    if (!graph.end_capture()) {
+        graph.destroy();
+        recorder.shutdown();
+        return false;
+    }
+
+    tt::RecorderGraphControl control{};
+    control.region_mask = (1ull << 2) - 1ull;
+    control.snapshot_period = 0;
+    control.flags = tt::kGraphControlStampsEnabled;
+    if (!recorder.update_graph_control(control, stream)) {
+        graph.destroy();
+        recorder.shutdown();
+        return false;
+    }
+
+    std::vector<uint32_t> expected_region1(epoch_count, 0u);
+    uint32_t last_region1_epoch = 0u;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        set_epoch_kernel<<<1, 1, 0, stream>>>(d_epoch_counter, epoch);
+        if (epoch % 2 == 1) {
+            control.region_mask = 0x1ull;
+        } else {
+            control.region_mask = 0x3ull;
+            last_region1_epoch = epoch;
+        }
+        control.snapshot_period = (epoch % 3 == 0) ? 1u : 0u;
+        control.flags = (epoch % 2 == 0) ? tt::kGraphControlStampsEnabled : 0u;
+        if (!recorder.update_graph_control(control, stream)) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+        expected_region1[epoch] = last_region1_epoch;
+        if (!graph.launch(stream)) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+    }
+    if (!check_cuda(cudaStreamSynchronize(stream), "ctrl sync")) {
+        graph.destroy();
+        recorder.shutdown();
+        return false;
+    }
+
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        if (!recorder.rewind_to_epoch(epoch, stream)) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+        std::vector<uint32_t> host_a(element_count);
+        std::vector<uint32_t> host_b(element_count);
+        if (!check_cuda(cudaMemcpy(host_a.data(), d_buffer_a, size_bytes, cudaMemcpyDeviceToHost), "memcpy ctrl out A") ||
+            !check_cuda(cudaMemcpy(host_b.data(), d_buffer_b, size_bytes, cudaMemcpyDeviceToHost), "memcpy ctrl out B")) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+        if (!verify_pattern(host_a, epoch)) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+        if (!verify_pattern(host_b, expected_region1[epoch])) {
+            graph.destroy();
+            recorder.shutdown();
+            return false;
+        }
+    }
+
+    graph.destroy();
+    recorder.shutdown();
+    cudaStreamDestroy(stream);
+    cudaFree(d_stamp_counter);
+    cudaFree(d_stamps);
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer_b);
+    cudaFree(d_buffer_a);
+    return true;
+}
+
 bool run_deterministic_manifest_capture(const char* manifest_path, uint32_t epoch_count) {
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
@@ -1091,6 +1490,24 @@ int main() {
     bool ok_graph = test_graph_capture_and_trace();
     if (!ok_graph) {
         std::printf("test_graph_capture_and_trace failed\n");
+        return 1;
+    }
+
+    bool ok_graph_params = test_graph_iter_params_update();
+    if (!ok_graph_params) {
+        std::printf("test_graph_iter_params_update failed\n");
+        return 1;
+    }
+
+    bool ok_graph_patch = test_graph_kernel_param_patch();
+    if (!ok_graph_patch) {
+        std::printf("test_graph_kernel_param_patch failed\n");
+        return 1;
+    }
+
+    bool ok_graph_controls = test_graph_control_updates();
+    if (!ok_graph_controls) {
+        std::printf("test_graph_control_updates failed\n");
         return 1;
     }
 
