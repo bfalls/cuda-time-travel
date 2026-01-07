@@ -9,6 +9,9 @@ static constexpr uint32_t kChunkMagic = 0x54545243u;
 static constexpr uint16_t kChunkVersion = 1u;
 static constexpr uint16_t kChunkHeaderBytes = 32u;
 static constexpr uint32_t kChunkTypeSnapshot = 1u;
+static constexpr uint32_t kChunkTypeDeltaXorRle0 = 2u;
+static constexpr uint32_t kChunkTypeWrapMarker = 0xFFFFFFFFu;
+static constexpr uint32_t kChunkFlagWrapMarker = 1u << 0;
 
 struct alignas(64) ControlBlock {
     uint64_t write_pos;

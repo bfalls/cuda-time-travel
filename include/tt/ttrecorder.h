@@ -21,6 +21,7 @@ public:
     void shutdown();
 
     bool register_region(uint32_t region_id, void* device_ptr, uint32_t size_bytes, uint32_t options = 1);
+    bool set_region_full_snapshot_period(uint32_t region_id, uint32_t period);
 
     bool capture_epoch(cudaStream_t stream);
     bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
@@ -32,6 +33,13 @@ private:
     uint8_t* d_ring_ = nullptr;
     EpochRecord* d_epochs_ = nullptr;
     TrackedRegion* d_regions_ = nullptr;
+    uint8_t* d_baseline_arena_ = nullptr;
+    uint64_t* d_baseline_ptrs_ = nullptr;
+    uint8_t* d_scratch_arena_ = nullptr;
+    uint64_t* d_scratch_ptrs_ = nullptr;
+    uint32_t* d_first_ring_offset_ = nullptr;
+    uint32_t* d_first_was_written_ = nullptr;
+    bool enable_deltas_ = true;
     bool initialized_ = false;
 };
 
