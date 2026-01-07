@@ -1,4 +1,5 @@
 #include "tt/tt_graph.h"
+#include "tt/tt_cupti.h"
 #include "tt/tt_trace.h"
 #include "tt/ttrecorder.h"
 
@@ -43,6 +44,7 @@ bool verify_pattern(const std::vector<uint32_t>& data, uint32_t epoch) {
 } // namespace
 
 int main() {
+    tt::GetCuptiKernelTracer();
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
     const uint32_t epoch_count = 8;
@@ -350,6 +352,7 @@ int main() {
         trace.add_event(epoch_regions);
     }
 
+    tt::GetCuptiKernelTracer().append_kernel_events(trace);
     trace.write("trace/tt_trace.json");
 
     if (!recorder.rewind_to_epoch(target_epoch, stream)) {
