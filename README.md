@@ -27,6 +27,8 @@ cmake --build build --config Release
 .\build\Release\tt_demo_graph.exe
 .\build\Release\tt_demo_graph_patch.exe
 .\build\Release\tt_demo_determinism.exe
+.\build\Release\tt_demo_multistream_stress.exe --deps
+.\build\Release\tt_demo_multistream_stress.exe --no-deps
 .\build\Release\tt_tests.exe
 ```
 
@@ -61,6 +63,19 @@ start chrome "chrome://tracing"
 
 Notes:
 - `ring_bytes` must be a multiple of 32 bytes.
+
+## Multi-stream correctness
+
+When producers write tracked regions on different streams, the capture stream should wait on a producer-completed event per region. Without dependencies, captures can observe partially-written data. The recorder supports per-region dependencies via `CaptureDeps` and `cudaStreamWaitEvent`.
+
+See `docs/multistream.md` for the dependency model, trace stamps, and a minimal code snippet.
+
+Example commands:
+
+```
+.\build\Release\tt_demo_multistream_stress.exe --deps
+.\build\Release\tt_demo_multistream_stress.exe --no-deps
+```
 
 ## Deterministic replay mode
 

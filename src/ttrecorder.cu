@@ -797,16 +797,24 @@ bool Recorder::init(const RecorderConfig& cfg) {
         last_status_ = RecorderStatus::kInvalidConfig;
         return false;
     }
+    if (cfg.enable_dep_stamps && (!cfg.dep_stamps || !cfg.dep_stamp_counter || cfg.dep_stamp_capacity == 0u)) {
+        last_status_ = RecorderStatus::kInvalidConfig;
+        return false;
+    }
 
     cfg_ = cfg;
     enable_graph_stamps_ = cfg.enable_graph_stamps;
     d_graph_stamps_ = cfg.graph_stamps;
     d_graph_stamp_counter_ = cfg.graph_stamp_counter;
+    d_dep_stamps_ = cfg.dep_stamps;
+    d_dep_stamp_counter_ = cfg.dep_stamp_counter;
+    dep_stamp_capacity_ = cfg.dep_stamp_capacity;
     deterministic_ = cfg.deterministic;
     enable_manifest_ = cfg.enable_manifest;
     deterministic_stream_ = nullptr;
     deterministic_stream_set_ = false;
     manifest_epochs_.clear();
+    dep_wait_records_.clear();
 
     cudaError_t err = cudaSuccess;
     err = cudaMalloc(reinterpret_cast<void**>(&d_control_), sizeof(ControlBlock));
@@ -861,6 +869,13 @@ bool Recorder::init(const RecorderConfig& cfg) {
     }
     if (enable_graph_stamps_) {
         err = cudaMalloc(reinterpret_cast<void**>(&d_stamp_base_), sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
+    if (cfg_.enable_dep_stamps) {
+        err = cudaMalloc(reinterpret_cast<void**>(&d_dep_stamp_base_), sizeof(uint32_t));
         if (err != cudaSuccess) {
             shutdown();
             return false;
@@ -960,8 +975,22 @@ bool Recorder::init(const RecorderConfig& cfg) {
             return false;
         }
     }
+    if (cfg_.enable_dep_stamps && d_dep_stamp_base_) {
+        err = cudaMemset(d_dep_stamp_base_, 0, sizeof(uint32_t));
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
     if (enable_manifest_ && d_region_hashes_) {
         err = cudaMemset(d_region_hashes_, 0, sizeof(uint64_t) * cfg_.region_capacity);
+        if (err != cudaSuccess) {
+            shutdown();
+            return false;
+        }
+    }
+    if (cfg_.enable_dep_stamps && d_dep_stamp_counter_) {
+        err = cudaMemset(d_dep_stamp_counter_, 0, sizeof(uint32_t));
         if (err != cudaSuccess) {
             shutdown();
             return false;
@@ -1048,6 +1077,10 @@ void Recorder::shutdown() {
         cudaFree(d_stamp_base_);
         d_stamp_base_ = nullptr;
     }
+    if (d_dep_stamp_base_) {
+        cudaFree(d_dep_stamp_base_);
+        d_dep_stamp_base_ = nullptr;
+    }
     if (d_region_hashes_) {
         cudaFree(d_region_hashes_);
         d_region_hashes_ = nullptr;
@@ -1093,7 +1126,11 @@ void Recorder::shutdown() {
     deterministic_stream_set_ = false;
     d_graph_stamps_ = nullptr;
     d_graph_stamp_counter_ = nullptr;
+    d_dep_stamps_ = nullptr;
+    d_dep_stamp_counter_ = nullptr;
+    dep_stamp_capacity_ = 0;
     graph_control_host_ = RecorderGraphControl{};
+    dep_wait_records_.clear();
 }
 
 bool Recorder::register_region(uint32_t region_id, void* device_ptr, uint32_t size_bytes, uint32_t options) {
@@ -1286,6 +1323,11 @@ bool Recorder::update_region_pointer(uint32_t region_id, void* device_ptr) {
 }
 
 bool Recorder::capture_epoch(cudaStream_t stream) {
+    CaptureDeps deps{};
+    return capture_epoch(stream, deps);
+}
+
+bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
     last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
         last_status_ = RecorderStatus::kNotInitialized;
@@ -1299,6 +1341,40 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             last_status_ = RecorderStatus::kDeterminismViolation;
             return false;
         }
+    }
+
+    if (deps.count > 0 && !deps.deps) {
+        last_status_ = RecorderStatus::kInvalidDependency;
+        return false;
+    }
+    std::vector<int32_t> dep_index_by_region;
+    dep_index_by_region.assign(cfg_.region_capacity, -1);
+    uint32_t dep_count = 0;
+    for (size_t i = 0; i < deps.count; ++i) {
+        const CaptureDependency& dep = deps.deps[i];
+        if (dep.event == nullptr) {
+            last_status_ = RecorderStatus::kInvalidDependency;
+            return false;
+        }
+        if (dep.region_id >= cfg_.region_capacity) {
+            last_status_ = RecorderStatus::kInvalidDependency;
+            return false;
+        }
+        const TrackedRegion& region = host_regions_[dep.region_id];
+        if ((region.options & 1u) == 0u || region.size_bytes == 0u || region.base_ptr == 0u) {
+            last_status_ = RecorderStatus::kInvalidDependency;
+            return false;
+        }
+        if (dep_index_by_region[dep.region_id] >= 0) {
+            last_status_ = RecorderStatus::kInvalidDependency;
+            return false;
+        }
+        dep_index_by_region[dep.region_id] = static_cast<int32_t>(i);
+        ++dep_count;
+    }
+    if (dep_count > 0u && cfg_.enable_dep_stamps && dep_stamp_capacity_ < dep_count * 2u) {
+        last_status_ = RecorderStatus::kInvalidConfig;
+        return false;
     }
 
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -1335,6 +1411,14 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             last_status_ = RecorderStatus::kCudaError;
             return false;
         }
+        if (cfg_.enable_dep_stamps && dep_count > 0u) {
+            reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_dep_stamp_counter_, d_dep_stamp_base_, dep_count * 2u);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
         if (enable_graph_stamps_) {
             reserve_stamp_range_controlled_kernel<<<1, 1, 0, stream>>>(
                 d_graph_control_,
@@ -1355,6 +1439,31 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
                 return false;
+            }
+        }
+
+        for (size_t i = 0; i < deps.count; ++i) {
+            const CaptureDependency& dep = deps.deps[i];
+            if (cfg_.enable_dep_stamps && dep_count > 0u) {
+                stamp_kernel<<<1, 1, 0, stream>>>(d_dep_stamps_, d_dep_stamp_base_, static_cast<uint32_t>(i * 2u));
+                err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    last_status_ = RecorderStatus::kCudaError;
+                    return false;
+                }
+            }
+            err = cudaStreamWaitEvent(stream, dep.event, 0);
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+            if (cfg_.enable_dep_stamps && dep_count > 0u) {
+                stamp_kernel<<<1, 1, 0, stream>>>(d_dep_stamps_, d_dep_stamp_base_, static_cast<uint32_t>(i * 2u + 1u));
+                err = cudaGetLastError();
+                if (err != cudaSuccess) {
+                    last_status_ = RecorderStatus::kCudaError;
+                    return false;
+                }
             }
         }
 
@@ -1438,6 +1547,16 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
         last_status_ = RecorderStatus::kCudaError;
         return false;
     }
+    uint32_t dep_stamp_base = 0;
+    bool dep_stamp_base_valid = false;
+    if (cfg_.enable_dep_stamps && dep_count > 0u) {
+        reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_dep_stamp_counter_, d_dep_stamp_base_, dep_count * 2u);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
     if (enable_graph_stamps_) {
         reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_graph_stamp_counter_, d_stamp_base_, kStampsPerEpoch);
         err = cudaGetLastError();
@@ -1463,6 +1582,31 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
         return false;
+    }
+
+    for (size_t i = 0; i < deps.count; ++i) {
+        const CaptureDependency& dep = deps.deps[i];
+        if (cfg_.enable_dep_stamps && dep_count > 0u) {
+            stamp_kernel<<<1, 1, 0, stream>>>(d_dep_stamps_, d_dep_stamp_base_, static_cast<uint32_t>(i * 2u));
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
+        err = cudaStreamWaitEvent(stream, dep.event, 0);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+        if (cfg_.enable_dep_stamps && dep_count > 0u) {
+            stamp_kernel<<<1, 1, 0, stream>>>(d_dep_stamps_, d_dep_stamp_base_, static_cast<uint32_t>(i * 2u + 1u));
+            err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                last_status_ = RecorderStatus::kCudaError;
+                return false;
+            }
+        }
     }
 
     std::vector<uint32_t> delta_sizes(cfg_.region_capacity, 0u);
@@ -1815,6 +1959,14 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             return false;
         }
     }
+    if (cfg_.enable_dep_stamps && dep_count > 0u) {
+        err = cudaMemcpyAsync(&dep_stamp_base, d_dep_stamp_base_, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+        dep_stamp_base_valid = true;
+    }
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
@@ -1871,6 +2023,22 @@ bool Recorder::capture_epoch(cudaStream_t stream) {
             manifest_epoch.regions.push_back(manifest_region);
         }
         manifest_epochs_.push_back(std::move(manifest_epoch));
+    }
+
+    if (cfg_.enable_dep_stamps && dep_count > 0u && dep_stamp_base_valid) {
+        dep_wait_records_.reserve(dep_wait_records_.size() + dep_count);
+        for (size_t i = 0; i < deps.count; ++i) {
+            const CaptureDependency& dep = deps.deps[i];
+            DepWaitRecord wait{};
+            wait.epoch_id = host_begin.epoch_id;
+            wait.region_id = dep.region_id;
+            wait.event_ptr = reinterpret_cast<uint64_t>(dep.event);
+            wait.producer_stream = reinterpret_cast<uint64_t>(dep.producer_stream);
+            wait.capture_stream = reinterpret_cast<uint64_t>(stream);
+            wait.stamp_index_begin = dep_stamp_base + static_cast<uint32_t>(i * 2u);
+            wait.stamp_index_end = dep_stamp_base + static_cast<uint32_t>(i * 2u + 1u);
+            dep_wait_records_.push_back(wait);
+        }
     }
 
     return true;

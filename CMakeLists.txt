@@ -56,6 +56,12 @@ add_executable(tt_demo_graph_patch
 
 target_link_libraries(tt_demo_graph_patch PRIVATE ttrecorder)
 
+add_executable(tt_demo_multistream_stress
+    demo/tt_demo_multistream_stress.cu
+)
+
+target_link_libraries(tt_demo_multistream_stress PRIVATE ttrecorder)
+
 add_executable(tt_tests
     tests/tt_tests.cu
 )
