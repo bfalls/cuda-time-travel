@@ -29,7 +29,8 @@ enum class RecorderStatus : uint32_t {
     kInvalidPayload,
     kAlignmentError,
     kEpochNotFound,
-    kEpochDropped
+    kEpochDropped,
+    kDeterminismViolation
 };
 
 struct RecorderConfig {
@@ -38,9 +39,26 @@ struct RecorderConfig {
     uint32_t region_capacity = 0;
     uint32_t retention_epochs = 0;
     OverwriteMode overwrite_mode = OverwriteMode::kDropOldest;
+    bool deterministic = false;
+    bool enable_manifest = false;
     bool enable_graph_stamps = false;
     uint64_t* graph_stamps = nullptr;
     uint32_t* graph_stamp_counter = nullptr;
+};
+
+struct ManifestRegion {
+    uint32_t region_id = 0;
+    uint32_t size_bytes = 0;
+    uint64_t hash64 = 0;
+    uint32_t payload_bytes = 0;
+    uint32_t uncompressed_bytes = 0;
+    bool snapshot = true;
+};
+
+struct ManifestEpoch {
+    uint32_t epoch_id = 0;
+    uint32_t ring_bytes_written = 0;
+    std::vector<ManifestRegion> regions{};
 };
 
 class Recorder {
@@ -54,6 +72,9 @@ public:
     bool capture_epoch(cudaStream_t stream);
     bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
     bool read_epochs_to_host(std::vector<EpochRecord>& out);
+    bool write_manifest_json(const char* path) const;
+    void clear_manifest();
+    const std::vector<ManifestEpoch>& manifest() const { return manifest_epochs_; }
     RecorderStatus last_status() const { return last_status_; }
 
 private:
@@ -71,9 +92,15 @@ private:
     uint32_t* d_delta_sizes_ = nullptr;
     DeviceEpochBegin* d_epoch_begin_ = nullptr;
     uint32_t* d_stamp_base_ = nullptr;
+    uint64_t* d_region_hashes_ = nullptr;
     std::vector<TrackedRegion> host_regions_{};
+    std::vector<ManifestEpoch> manifest_epochs_{};
     bool enable_deltas_ = true;
     bool enable_graph_stamps_ = false;
+    bool deterministic_ = false;
+    bool enable_manifest_ = false;
+    cudaStream_t deterministic_stream_ = nullptr;
+    bool deterministic_stream_set_ = false;
     uint64_t* d_graph_stamps_ = nullptr;
     uint32_t* d_graph_stamp_counter_ = nullptr;
     bool initialized_ = false;

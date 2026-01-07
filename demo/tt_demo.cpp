@@ -43,9 +43,13 @@ int main() {
     bool enable_deltas = true;
     uint32_t retention_epochs = 0;
     tt::OverwriteMode overwrite_mode = tt::OverwriteMode::kDropOldest;
+    bool deterministic = false;
+    const char* manifest_path = nullptr;
     for (int i = 1; i < __argc; ++i) {
         if (std::strcmp(__argv[i], "--no-delta") == 0) {
             enable_deltas = false;
+        } else if (std::strcmp(__argv[i], "--deterministic") == 0) {
+            deterministic = true;
         } else if (std::strncmp(__argv[i], "--ring-bytes=", 13) == 0) {
             ring_bytes = static_cast<uint32_t>(std::strtoul(__argv[i] + 13, nullptr, 10));
         } else if (std::strncmp(__argv[i], "--retention-epochs=", 19) == 0) {
@@ -57,6 +61,8 @@ int main() {
             } else if (std::strcmp(mode, "drop") == 0) {
                 overwrite_mode = tt::OverwriteMode::kDropOldest;
             }
+        } else if (std::strncmp(__argv[i], "--manifest-out=", 15) == 0) {
+            manifest_path = __argv[i] + 15;
         }
     }
 
@@ -94,6 +100,8 @@ int main() {
     cfg.region_capacity = 8;
     cfg.retention_epochs = retention_epochs;
     cfg.overwrite_mode = overwrite_mode;
+    cfg.deterministic = deterministic;
+    cfg.enable_manifest = (manifest_path != nullptr);
     if (!recorder.init(cfg)) {
         std::printf("recorder init failed\n");
         cudaFree(d_buffer_b);
@@ -181,6 +189,16 @@ int main() {
             return 1;
         }
         ok_b = verify_pattern(host_out, 0x2000u + target_epoch);
+    }
+
+    if (manifest_path) {
+        if (!recorder.write_manifest_json(manifest_path)) {
+            std::printf("manifest write failed\n");
+            recorder.shutdown();
+            cudaFree(d_buffer_b);
+            cudaFree(d_buffer_a);
+            return 1;
+        }
     }
 
     recorder.shutdown();

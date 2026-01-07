@@ -56,6 +56,14 @@ bool trace_json_valid(const char* path) {
     return true;
 }
 
+std::string read_file_bytes(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) {
+        return {};
+    }
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
 void fill_pattern(std::vector<uint32_t>& data, uint32_t seed) {
     for (size_t i = 0; i < data.size(); ++i) {
         data[i] = seed ^ static_cast<uint32_t>(i * 2654435761u);
@@ -886,6 +894,154 @@ bool test_graph_capture_and_trace() {
     return valid_trace;
 }
 
+bool run_deterministic_manifest_capture(const char* manifest_path, uint32_t epoch_count) {
+    const uint32_t element_count = 1024;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+
+    uint32_t* d_buffer = nullptr;
+    uint32_t* d_epoch_counter = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc deterministic buffer")) {
+        return false;
+    }
+    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc deterministic counter")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
+    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = ring_bytes;
+    cfg.epoch_capacity = 32;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = true;
+    cfg.enable_manifest = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_epoch_counter);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t threads = 256;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        set_epoch_kernel<<<1, 1>>>(d_epoch_counter, epoch);
+        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_epoch_counter);
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_epoch_counter);
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    bool wrote_manifest = recorder.write_manifest_json(manifest_path);
+    recorder.shutdown();
+    cudaFree(d_epoch_counter);
+    cudaFree(d_buffer);
+    return wrote_manifest;
+}
+
+bool test_deterministic_manifest_match() {
+    const uint32_t epoch_count = 6;
+    const char* path_a = "trace/tt_manifest_a.json";
+    const char* path_b = "trace/tt_manifest_b.json";
+    if (!run_deterministic_manifest_capture(path_a, epoch_count)) {
+        return false;
+    }
+    if (!run_deterministic_manifest_capture(path_b, epoch_count)) {
+        return false;
+    }
+    const std::string manifest_a = read_file_bytes(path_a);
+    const std::string manifest_b = read_file_bytes(path_b);
+    if (manifest_a.empty() || manifest_b.empty()) {
+        return false;
+    }
+    return manifest_a == manifest_b;
+}
+
+bool test_deterministic_rewind() {
+    const uint32_t element_count = 512;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = 5;
+    const uint32_t target_epoch = 3;
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc deterministic rewind")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = 65536;
+    cfg.epoch_capacity = 16;
+    cfg.region_capacity = 4;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    cfg.deterministic = true;
+    if (!recorder.init(cfg)) {
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    std::vector<uint32_t> host_model(element_count);
+    std::vector<uint32_t> host_out(element_count);
+    std::vector<uint32_t> expected(element_count);
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        fill_pattern(host_model, 0xBEEF0000u + epoch);
+        if (epoch == target_epoch) {
+            expected = host_model;
+        }
+        if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy deterministic in")) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!recorder.capture_epoch(0)) {
+            recorder.shutdown();
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy deterministic out")) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+    bool ok = (host_out == expected);
+    if (!ok) {
+        recorder.shutdown();
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    recorder.shutdown();
+    cudaFree(d_buffer);
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -935,6 +1091,18 @@ int main() {
     bool ok_graph = test_graph_capture_and_trace();
     if (!ok_graph) {
         std::printf("test_graph_capture_and_trace failed\n");
+        return 1;
+    }
+
+    bool ok_manifest = test_deterministic_manifest_match();
+    if (!ok_manifest) {
+        std::printf("test_deterministic_manifest_match failed\n");
+        return 1;
+    }
+
+    bool ok_det_rewind = test_deterministic_rewind();
+    if (!ok_det_rewind) {
+        std::printf("test_deterministic_rewind failed\n");
         return 1;
     }
 
