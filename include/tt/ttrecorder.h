@@ -5,6 +5,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
+#include "tt/tt_graph_patch.h"
 #include "tt/tt_layout.h"
 
 namespace tt {
@@ -76,6 +77,10 @@ public:
     void clear_manifest();
     const std::vector<ManifestEpoch>& manifest() const { return manifest_epochs_; }
     RecorderStatus last_status() const { return last_status_; }
+    const RecorderGraphControl* graph_control_device() const { return d_graph_control_; }
+    bool update_graph_control(const RecorderGraphControl& control, cudaStream_t stream);
+    bool update_region_enable_bitmap(const uint32_t* bitmap, uint32_t words, cudaStream_t stream);
+    bool update_region_pointer(uint32_t region_id, void* device_ptr);
 
 private:
     RecorderConfig cfg_{};
@@ -93,6 +98,10 @@ private:
     DeviceEpochBegin* d_epoch_begin_ = nullptr;
     uint32_t* d_stamp_base_ = nullptr;
     uint64_t* d_region_hashes_ = nullptr;
+    RecorderGraphControl* d_graph_control_ = nullptr;
+    uint32_t* d_region_enable_bitmap_ = nullptr;
+    uint32_t* d_enabled_count_ = nullptr;
+    RecorderGraphControl graph_control_host_{};
     std::vector<TrackedRegion> host_regions_{};
     std::vector<ManifestEpoch> manifest_epochs_{};
     bool enable_deltas_ = true;
