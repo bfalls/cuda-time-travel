@@ -2,6 +2,7 @@
 #define TTRECORDER_H
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -21,6 +22,7 @@ enum class RecorderStatus : uint32_t {
     kOk = 0,
     kNotInitialized,
     kInvalidConfig,
+    kInvalidDependency,
     kCudaError,
     kBackpressure,
     kRingTooSmall,
@@ -45,6 +47,10 @@ struct RecorderConfig {
     bool enable_graph_stamps = false;
     uint64_t* graph_stamps = nullptr;
     uint32_t* graph_stamp_counter = nullptr;
+    bool enable_dep_stamps = false;
+    uint64_t* dep_stamps = nullptr;
+    uint32_t* dep_stamp_counter = nullptr;
+    uint32_t dep_stamp_capacity = 0;
 };
 
 struct ManifestRegion {
@@ -62,6 +68,27 @@ struct ManifestEpoch {
     std::vector<ManifestRegion> regions{};
 };
 
+struct CaptureDependency {
+    uint32_t region_id = 0;
+    cudaEvent_t event = nullptr;
+    cudaStream_t producer_stream = nullptr;
+};
+
+struct CaptureDeps {
+    const CaptureDependency* deps = nullptr;
+    size_t count = 0;
+};
+
+struct DepWaitRecord {
+    uint32_t epoch_id = 0;
+    uint32_t region_id = 0;
+    uint64_t event_ptr = 0;
+    uint64_t producer_stream = 0;
+    uint64_t capture_stream = 0;
+    uint32_t stamp_index_begin = 0;
+    uint32_t stamp_index_end = 0;
+};
+
 class Recorder {
 public:
     bool init(const RecorderConfig& cfg);
@@ -71,6 +98,7 @@ public:
     bool set_region_full_snapshot_period(uint32_t region_id, uint32_t period);
 
     bool capture_epoch(cudaStream_t stream);
+    bool capture_epoch(cudaStream_t stream, const CaptureDeps& deps);
     bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
     bool read_epochs_to_host(std::vector<EpochRecord>& out);
     bool write_manifest_json(const char* path) const;
@@ -81,6 +109,8 @@ public:
     bool update_graph_control(const RecorderGraphControl& control, cudaStream_t stream);
     bool update_region_enable_bitmap(const uint32_t* bitmap, uint32_t words, cudaStream_t stream);
     bool update_region_pointer(uint32_t region_id, void* device_ptr);
+
+    const std::vector<DepWaitRecord>& dep_wait_records() const { return dep_wait_records_; }
 
 private:
     RecorderConfig cfg_{};
@@ -97,6 +127,7 @@ private:
     uint32_t* d_delta_sizes_ = nullptr;
     DeviceEpochBegin* d_epoch_begin_ = nullptr;
     uint32_t* d_stamp_base_ = nullptr;
+    uint32_t* d_dep_stamp_base_ = nullptr;
     uint64_t* d_region_hashes_ = nullptr;
     RecorderGraphControl* d_graph_control_ = nullptr;
     uint32_t* d_region_enable_bitmap_ = nullptr;
@@ -112,9 +143,13 @@ private:
     bool deterministic_stream_set_ = false;
     uint64_t* d_graph_stamps_ = nullptr;
     uint32_t* d_graph_stamp_counter_ = nullptr;
+    uint64_t* d_dep_stamps_ = nullptr;
+    uint32_t* d_dep_stamp_counter_ = nullptr;
+    uint32_t dep_stamp_capacity_ = 0;
     bool initialized_ = false;
     uint32_t min_valid_epoch_ = 0;
     RecorderStatus last_status_ = RecorderStatus::kOk;
+    std::vector<DepWaitRecord> dep_wait_records_{};
 };
 
 } // namespace tt

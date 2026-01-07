@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -118,6 +119,60 @@ void mutate_words(std::vector<uint32_t>& data, uint32_t epoch) {
         uint32_t index = (epoch * 7u + j * 13u) % static_cast<uint32_t>(data.size());
         data[index] ^= 0xA5A50000u + epoch * 17u + j;
     }
+}
+
+uint32_t get_env_u32(const char* name, uint32_t fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (!end || *end != '\0') {
+        return fallback;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
+__host__ __device__ uint32_t multistream_pattern(uint32_t epoch, uint32_t seed, uint32_t idx) {
+    return epoch ^ seed ^ (idx * 2654435761u);
+}
+
+__host__ __device__ uint32_t multistream_commit(uint32_t epoch, uint32_t seed) {
+    return epoch ^ seed ^ 0xA5A5A5A5u;
+}
+
+__global__ void write_region_data_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+    const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (count == 0u) {
+        return;
+    }
+    const uint32_t commit_index = count - 1u;
+    if (idx < commit_index) {
+        data[idx] = multistream_pattern(epoch, seed, idx);
+    }
+}
+
+__global__ void write_commit_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (count == 0u) {
+            return;
+        }
+        data[count - 1u] = multistream_commit(epoch, seed);
+    }
+}
+
+bool verify_multistream_region(const std::vector<uint32_t>& data, uint32_t epoch, uint32_t seed) {
+    if (data.size() < 2) {
+        return false;
+    }
+    const uint32_t commit_index = static_cast<uint32_t>(data.size() - 1u);
+    for (uint32_t i = 0; i < commit_index; ++i) {
+        if (data[i] != multistream_pattern(epoch, seed, i)) {
+            return false;
+        }
+    }
+    return data[commit_index] == multistream_commit(epoch, seed);
 }
 
 bool test_single_region() {
@@ -1441,6 +1496,396 @@ bool test_deterministic_rewind() {
     return true;
 }
 
+bool test_multistream_no_deps_failure() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc multistream buffer")) {
+        return false;
+    }
+
+    cudaStream_t producer_stream = nullptr;
+    cudaStream_t capture_stream = nullptr;
+    cudaEvent_t data_event = nullptr;
+    if (!check_cuda(cudaStreamCreate(&producer_stream), "producer stream create") ||
+        !check_cuda(cudaStreamCreate(&capture_stream), "capture stream create") ||
+        !check_cuda(cudaEventCreateWithFlags(&data_event, cudaEventDisableTiming), "data event create")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = size_bytes * (epoch_count + 2u) + 4096u;
+    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.region_capacity = 1;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    if (!recorder.init(cfg)) {
+        cudaEventDestroy(data_event);
+        cudaStreamDestroy(capture_stream);
+        cudaStreamDestroy(producer_stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaEventDestroy(data_event);
+        cudaStreamDestroy(capture_stream);
+        cudaStreamDestroy(producer_stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t seed = 0xABCDEF01u;
+    const uint32_t threads = 128;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        write_region_data_kernel<<<blocks, threads, 0, producer_stream>>>(
+            static_cast<uint32_t*>(d_buffer),
+            element_count,
+            epoch,
+            seed);
+        if (!check_cuda(cudaGetLastError(), "launch data kernel")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaEventRecord(data_event, producer_stream), "record data event")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaEventSynchronize(data_event), "sync data event")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+
+        if (!recorder.capture_epoch(capture_stream)) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+
+        write_commit_kernel<<<1, 1, 0, producer_stream>>>(
+            static_cast<uint32_t*>(d_buffer),
+            element_count,
+            epoch,
+            seed);
+        if (!check_cuda(cudaGetLastError(), "launch commit kernel")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaStreamSynchronize(producer_stream), "producer sync")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    std::vector<uint32_t> host_data(element_count, 0u);
+    uint32_t mismatches = 0;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        if (!recorder.rewind_to_epoch(epoch, capture_stream)) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaMemcpy(host_data.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy multistream")) {
+            recorder.shutdown();
+            cudaEventDestroy(data_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!verify_multistream_region(host_data, epoch, seed)) {
+            ++mismatches;
+        }
+    }
+
+    recorder.shutdown();
+    cudaEventDestroy(data_event);
+    cudaStreamDestroy(capture_stream);
+    cudaStreamDestroy(producer_stream);
+    cudaFree(d_buffer);
+
+    return mismatches > 0u;
+}
+
+bool test_multistream_with_deps_success() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+
+    void* d_buffer = nullptr;
+    if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc multistream buffer deps")) {
+        return false;
+    }
+
+    cudaStream_t producer_stream = nullptr;
+    cudaStream_t capture_stream = nullptr;
+    cudaEvent_t commit_event = nullptr;
+    if (!check_cuda(cudaStreamCreate(&producer_stream), "producer stream create deps") ||
+        !check_cuda(cudaStreamCreate(&capture_stream), "capture stream create deps") ||
+        !check_cuda(cudaEventCreateWithFlags(&commit_event, cudaEventDisableTiming), "commit event create deps")) {
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = size_bytes * (epoch_count + 2u) + 4096u;
+    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.region_capacity = 1;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    if (!recorder.init(cfg)) {
+        cudaEventDestroy(commit_event);
+        cudaStreamDestroy(capture_stream);
+        cudaStreamDestroy(producer_stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+    if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
+        recorder.shutdown();
+        cudaEventDestroy(commit_event);
+        cudaStreamDestroy(capture_stream);
+        cudaStreamDestroy(producer_stream);
+        cudaFree(d_buffer);
+        return false;
+    }
+
+    const uint32_t seed = 0x12345678u;
+    const uint32_t threads = 128;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    tt::CaptureDependency dep{};
+    dep.region_id = 0;
+    dep.producer_stream = producer_stream;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        write_region_data_kernel<<<blocks, threads, 0, producer_stream>>>(
+            static_cast<uint32_t*>(d_buffer),
+            element_count,
+            epoch,
+            seed);
+        if (!check_cuda(cudaGetLastError(), "launch data kernel deps")) {
+            recorder.shutdown();
+            cudaEventDestroy(commit_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        write_commit_kernel<<<1, 1, 0, producer_stream>>>(
+            static_cast<uint32_t*>(d_buffer),
+            element_count,
+            epoch,
+            seed);
+        if (!check_cuda(cudaGetLastError(), "launch commit kernel deps")) {
+            recorder.shutdown();
+            cudaEventDestroy(commit_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaEventRecord(commit_event, producer_stream), "record commit event")) {
+            recorder.shutdown();
+            cudaEventDestroy(commit_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+
+        dep.event = commit_event;
+        tt::CaptureDeps deps{&dep, 1};
+        if (!recorder.capture_epoch(capture_stream, deps)) {
+            recorder.shutdown();
+            cudaEventDestroy(commit_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+        if (!check_cuda(cudaStreamSynchronize(producer_stream), "producer sync deps")) {
+            recorder.shutdown();
+            cudaEventDestroy(commit_event);
+            cudaStreamDestroy(capture_stream);
+            cudaStreamDestroy(producer_stream);
+            cudaFree(d_buffer);
+            return false;
+        }
+    }
+
+    std::vector<uint32_t> host_data(element_count, 0u);
+    bool ok = true;
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        if (!recorder.rewind_to_epoch(epoch, capture_stream)) {
+            ok = false;
+            break;
+        }
+        if (!check_cuda(cudaMemcpy(host_data.data(), d_buffer, size_bytes, cudaMemcpyDeviceToHost), "memcpy multistream deps")) {
+            ok = false;
+            break;
+        }
+        if (!verify_multistream_region(host_data, epoch, seed)) {
+            ok = false;
+            break;
+        }
+    }
+
+    recorder.shutdown();
+    cudaEventDestroy(commit_event);
+    cudaStreamDestroy(capture_stream);
+    cudaStreamDestroy(producer_stream);
+    cudaFree(d_buffer);
+
+    return ok;
+}
+
+bool test_multistream_multi_region() {
+    const uint32_t element_count = 256;
+    const uint32_t size_bytes = element_count * sizeof(uint32_t);
+    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+
+    void* d_buffers[2]{};
+    for (int i = 0; i < 2; ++i) {
+        if (!check_cuda(cudaMalloc(&d_buffers[i], size_bytes), "cudaMalloc multistream region")) {
+            return false;
+        }
+    }
+
+    cudaStream_t producer_streams[2]{};
+    cudaEvent_t commit_events[2]{};
+    cudaStream_t capture_stream = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        if (!check_cuda(cudaStreamCreate(&producer_streams[i]), "producer stream create multi") ||
+            !check_cuda(cudaEventCreateWithFlags(&commit_events[i], cudaEventDisableTiming), "commit event create multi")) {
+            return false;
+        }
+    }
+    if (!check_cuda(cudaStreamCreate(&capture_stream), "capture stream create multi")) {
+        return false;
+    }
+
+    tt::Recorder recorder;
+    tt::RecorderConfig cfg{};
+    cfg.ring_bytes = size_bytes * 2u * (epoch_count + 2u) + 4096u;
+    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.region_capacity = 2;
+    cfg.retention_epochs = 0;
+    cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
+    if (!recorder.init(cfg)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (!recorder.register_region(i, d_buffers[i], size_bytes, 1)) {
+            recorder.shutdown();
+            return false;
+        }
+    }
+
+    const uint32_t seeds[2] = {0x0BADF00Du, 0x0D15EA5Eu};
+    const uint32_t threads = 128;
+    const uint32_t blocks = (element_count + threads - 1u) / threads;
+    tt::CaptureDependency deps[2]{};
+    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+        for (uint32_t r = 0; r < 2; ++r) {
+            write_region_data_kernel<<<blocks, threads, 0, producer_streams[r]>>>(
+                static_cast<uint32_t*>(d_buffers[r]),
+                element_count,
+                epoch,
+                seeds[r]);
+            if (!check_cuda(cudaGetLastError(), "launch data kernel multi")) {
+                recorder.shutdown();
+                return false;
+            }
+            write_commit_kernel<<<1, 1, 0, producer_streams[r]>>>(
+                static_cast<uint32_t*>(d_buffers[r]),
+                element_count,
+                epoch,
+                seeds[r]);
+            if (!check_cuda(cudaGetLastError(), "launch commit kernel multi")) {
+                recorder.shutdown();
+                return false;
+            }
+            if (!check_cuda(cudaEventRecord(commit_events[r], producer_streams[r]), "record commit event multi")) {
+                recorder.shutdown();
+                return false;
+            }
+            deps[r].region_id = r;
+            deps[r].event = commit_events[r];
+            deps[r].producer_stream = producer_streams[r];
+        }
+
+        tt::CaptureDeps dep_list{deps, 2};
+        if (!recorder.capture_epoch(capture_stream, dep_list)) {
+            recorder.shutdown();
+            return false;
+        }
+        for (uint32_t r = 0; r < 2; ++r) {
+            if (!check_cuda(cudaStreamSynchronize(producer_streams[r]), "producer sync multi")) {
+                recorder.shutdown();
+                return false;
+            }
+        }
+    }
+
+    bool ok = true;
+    std::vector<uint32_t> host_data(element_count, 0u);
+    const uint32_t check_epoch = epoch_count > 0 ? (epoch_count - 1u) : 0u;
+    if (!recorder.rewind_to_epoch(check_epoch, capture_stream)) {
+        ok = false;
+    } else {
+        for (uint32_t r = 0; r < 2; ++r) {
+            if (!check_cuda(cudaMemcpy(host_data.data(), d_buffers[r], size_bytes, cudaMemcpyDeviceToHost), "memcpy multistream multi")) {
+                ok = false;
+                break;
+            }
+            if (!verify_multistream_region(host_data, check_epoch, seeds[r])) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    recorder.shutdown();
+    for (uint32_t r = 0; r < 2; ++r) {
+        cudaEventDestroy(commit_events[r]);
+        cudaStreamDestroy(producer_streams[r]);
+        cudaFree(d_buffers[r]);
+    }
+    cudaStreamDestroy(capture_stream);
+
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -1520,6 +1965,24 @@ int main() {
     bool ok_det_rewind = test_deterministic_rewind();
     if (!ok_det_rewind) {
         std::printf("test_deterministic_rewind failed\n");
+        return 1;
+    }
+
+    bool ok_multistream_fail = test_multistream_no_deps_failure();
+    if (!ok_multistream_fail) {
+        std::printf("test_multistream_no_deps_failure failed\n");
+        return 1;
+    }
+
+    bool ok_multistream_deps = test_multistream_with_deps_success();
+    if (!ok_multistream_deps) {
+        std::printf("test_multistream_with_deps_success failed\n");
+        return 1;
+    }
+
+    bool ok_multistream_multi = test_multistream_multi_region();
+    if (!ok_multistream_multi) {
+        std::printf("test_multistream_multi_region failed\n");
         return 1;
     }
 
