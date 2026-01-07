@@ -322,7 +322,7 @@ int main(int argc, char** argv) {
         tt::IterParams host_params{};
         host_params.epoch = iter;
         host_params.seed = 0x1234u + iter;
-        host_params.flags = (iter & 1u);
+        host_params.flags = use_kernel_patch ? 0u : (iter & 1u);
         if (!use_kernel_patch) {
             if (!check_cuda(cudaMemcpyAsync(d_iter_params,
                     &host_params,
@@ -398,7 +398,7 @@ int main(int argc, char** argv) {
     tt::IterParams final_params{};
     final_params.epoch = target_epoch;
     final_params.seed = 0x1234u + target_epoch;
-    final_params.flags = (target_epoch & 1u);
+    final_params.flags = use_kernel_patch ? 0u : (target_epoch & 1u);
     if (!verify_pattern(host_out, final_params.epoch, final_params.seed, final_params.flags)) {
         std::printf("tt_demo_graph_patch verification failed\n");
         graph.destroy();
