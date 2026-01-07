@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <string>
 #include <cuda_runtime.h>
 
 #include "tt/tt_graph_patch.h"
@@ -12,6 +13,7 @@
 namespace tt {
 
 struct DeviceEpochBegin;
+class TraceCollector;
 
 enum class OverwriteMode : uint32_t {
     kDropOldest = 0,
@@ -89,6 +91,56 @@ struct DepWaitRecord {
     uint32_t stamp_index_end = 0;
 };
 
+struct VerifyTamper {
+    bool enabled = false;
+    uint32_t epoch_id = 0;
+    uint32_t region_id = 0;
+    uint32_t byte_offset = 0;
+    uint8_t xor_mask = 0;
+};
+
+struct VerifyMismatch {
+    uint32_t epoch_id = 0;
+    uint32_t region_id = 0;
+    uint64_t expected_hash64 = 0;
+    uint64_t actual_hash64 = 0;
+    bool localized = false;
+    uint32_t first_diff_offset_bytes = 0;
+    std::string expected_window_hex{};
+    std::string actual_window_hex{};
+    std::string localization_error{};
+};
+
+struct VerifyReport {
+    std::string status{};
+    uint32_t tested_epoch_begin = 0;
+    uint32_t tested_epoch_end = 0;
+    std::vector<uint32_t> tested_regions{};
+    bool has_mismatch = false;
+    VerifyMismatch first_mismatch{};
+    std::vector<VerifyMismatch> mismatches{};
+    std::string error{};
+    std::string device_name{};
+    int device_cc_major = 0;
+    int device_cc_minor = 0;
+    int driver_version = 0;
+    int runtime_version = 0;
+};
+
+struct VerifyOptions {
+    bool continue_on_mismatch = false;
+    bool localize = false;
+    bool trace_annotate = false;
+    bool epoch_range_set = false;
+    uint32_t epoch_begin = 0;
+    uint32_t epoch_end = 0;
+    std::vector<uint32_t> region_ids{};
+    const char* report_path = nullptr;
+    cudaStream_t stream = nullptr;
+    TraceCollector* trace = nullptr;
+    VerifyTamper tamper{};
+};
+
 class Recorder {
 public:
     bool init(const RecorderConfig& cfg);
@@ -109,6 +161,9 @@ public:
     bool update_graph_control(const RecorderGraphControl& control, cudaStream_t stream);
     bool update_region_enable_bitmap(const uint32_t* bitmap, uint32_t words, cudaStream_t stream);
     bool update_region_pointer(uint32_t region_id, void* device_ptr);
+    bool compute_region_hashes(cudaStream_t stream, const std::vector<uint32_t>& region_ids, uint64_t* d_out_hashes);
+    bool copy_region_hashes_to_host(cudaStream_t stream, const uint64_t* d_hashes, size_t count, std::vector<uint64_t>& out);
+    bool verify_manifest_json(const char* manifest_path, const VerifyOptions& options, VerifyReport* out_report);
 
     const std::vector<DepWaitRecord>& dep_wait_records() const { return dep_wait_records_; }
 

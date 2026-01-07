@@ -1322,6 +1322,78 @@ bool Recorder::update_region_pointer(uint32_t region_id, void* device_ptr) {
     return err == cudaSuccess;
 }
 
+bool Recorder::compute_region_hashes(cudaStream_t stream, const std::vector<uint32_t>& region_ids, uint64_t* d_out_hashes) {
+    if (!initialized_) {
+        last_status_ = RecorderStatus::kNotInitialized;
+        return false;
+    }
+    if (!d_out_hashes) {
+        last_status_ = RecorderStatus::kInvalidPayload;
+        return false;
+    }
+    if (region_ids.empty()) {
+        last_status_ = RecorderStatus::kOk;
+        return true;
+    }
+    cudaError_t err = cudaMemsetAsync(d_out_hashes, 0, sizeof(uint64_t) * region_ids.size(), stream);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        return false;
+    }
+    for (size_t i = 0; i < region_ids.size(); ++i) {
+        const uint32_t region_id = region_ids[i];
+        if (region_id >= cfg_.region_capacity) {
+            last_status_ = RecorderStatus::kInvalidConfig;
+            return false;
+        }
+        const TrackedRegion& region = host_regions_[region_id];
+        if ((region.options & 1u) == 0u || region.size_bytes == 0u || region.base_ptr == 0u) {
+            last_status_ = RecorderStatus::kInvalidConfig;
+            return false;
+        }
+        const uint8_t* region_ptr = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(region.base_ptr));
+        hash_region_kernel<<<1, kHashThreads, 0, stream>>>(region_ptr, region.size_bytes, d_out_hashes + i);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            last_status_ = RecorderStatus::kCudaError;
+            return false;
+        }
+    }
+    last_status_ = RecorderStatus::kOk;
+    return true;
+}
+
+bool Recorder::copy_region_hashes_to_host(cudaStream_t stream, const uint64_t* d_hashes, size_t count, std::vector<uint64_t>& out) {
+    out.clear();
+    if (!initialized_) {
+        last_status_ = RecorderStatus::kNotInitialized;
+        return false;
+    }
+    if (!d_hashes && count > 0) {
+        last_status_ = RecorderStatus::kInvalidPayload;
+        return false;
+    }
+    out.resize(count, 0u);
+    if (count == 0u) {
+        last_status_ = RecorderStatus::kOk;
+        return true;
+    }
+    cudaError_t err = cudaMemcpyAsync(out.data(), d_hashes, sizeof(uint64_t) * count, cudaMemcpyDeviceToHost, stream);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        out.clear();
+        return false;
+    }
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        last_status_ = RecorderStatus::kCudaError;
+        out.clear();
+        return false;
+    }
+    last_status_ = RecorderStatus::kOk;
+    return true;
+}
+
 bool Recorder::capture_epoch(cudaStream_t stream) {
     CaptureDeps deps{};
     return capture_epoch(stream, deps);

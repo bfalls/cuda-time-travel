@@ -9,6 +9,7 @@ option(TT_ENABLE_CUPTI "Enable CUPTI kernel tracing" OFF)
 
 add_library(ttrecorder STATIC
     src/ttrecorder.cu
+    src/tt_verify.cu
     src/tt_graph.cpp
     src/tt_trace.cpp
 )
@@ -38,6 +39,12 @@ add_executable(tt_demo
 
 target_link_libraries(tt_demo PRIVATE ttrecorder)
 
+add_executable(tt
+    demo/tt_cli.cpp
+)
+
+target_link_libraries(tt PRIVATE ttrecorder)
+
 add_executable(tt_demo_graph
     demo/tt_demo_graph.cu
 )
@@ -49,6 +56,12 @@ add_executable(tt_demo_determinism
 )
 
 target_link_libraries(tt_demo_determinism PRIVATE ttrecorder)
+
+add_executable(tt_demo_verify
+    demo/tt_demo_verify.cpp
+)
+
+target_link_libraries(tt_demo_verify PRIVATE ttrecorder)
 
 add_executable(tt_demo_graph_patch
     demo/tt_demo_graph_patch.cu
