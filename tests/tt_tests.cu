@@ -1,4 +1,5 @@
 #include "tt/tt_graph.h"
+#include "tt/tt_cupti.h"
 #include "tt/tt_trace.h"
 #include "tt/ttrecorder.h"
 
@@ -871,6 +872,7 @@ bool test_graph_capture_and_trace() {
     }
 
     trace.add_event({"graph_launch", "graph", 0.0, 1.0, 1, 0, {{"epoch_id", "0", false}}});
+    tt::GetCuptiKernelTracer().append_kernel_events(trace);
     trace.write("trace/tt_trace.json");
 
     const bool valid_trace = trace_json_valid("trace/tt_trace.json");
@@ -887,6 +889,7 @@ bool test_graph_capture_and_trace() {
 } // namespace
 
 int main() {
+    tt::GetCuptiKernelTracer();
     bool ok_single = test_single_region();
     if (!ok_single) {
         std::printf("test_single_region failed\n");
