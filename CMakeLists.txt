@@ -57,6 +57,12 @@ add_executable(tt_demo_determinism
 
 target_link_libraries(tt_demo_determinism PRIVATE ttrecorder)
 
+add_executable(tt_demo_single
+    demo/tt_demo_single.cu
+)
+
+target_link_libraries(tt_demo_single PRIVATE ttrecorder)
+
 add_executable(tt_demo_verify
     demo/tt_demo_verify.cpp
 )
