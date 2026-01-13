@@ -17,7 +17,7 @@ bool check_cuda(cudaError_t err, const char* label) {
     return false;
 }
 
-__global__ void set_epoch_kernel(uint32_t* counter, uint32_t value) {
+__global__ void set_checkpoint_kernel(uint32_t* counter, uint32_t value) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *counter = value;
     }
@@ -26,14 +26,14 @@ __global__ void set_epoch_kernel(uint32_t* counter, uint32_t value) {
 __global__ void write_pattern_kernel(uint32_t* data, uint32_t count, const uint32_t* counter) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count) {
-        const uint32_t epoch = *counter;
-        data[idx] = epoch ^ (idx * 2654435761u);
+        const uint32_t checkpoint = *counter;
+        data[idx] = checkpoint ^ (idx * 2654435761u);
     }
 }
 
-bool verify_pattern(const std::vector<uint32_t>& data, uint32_t epoch) {
+bool verify_pattern(const std::vector<uint32_t>& data, uint32_t checkpoint) {
     for (size_t i = 0; i < data.size(); ++i) {
-        uint32_t expected = epoch ^ (static_cast<uint32_t>(i) * 2654435761u);
+        uint32_t expected = checkpoint ^ (static_cast<uint32_t>(i) * 2654435761u);
         if (data[i] != expected) {
             return false;
         }
@@ -47,36 +47,36 @@ int main() {
     tt::GetCuptiKernelTracer();
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 8;
-    const uint32_t target_epoch = 3;
-    const uint32_t stamps_per_epoch = 3;
+    const uint32_t checkpoint_count = 8;
+    const uint32_t target_checkpoint = 3;
+    const uint32_t stamps_per_checkpoint = 3;
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     uint64_t* d_stamps = nullptr;
     uint32_t* d_stamp_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc buffer")) {
         return 1;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc epoch counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc checkpoint counter")) {
         cudaFree(d_buffer);
         return 1;
     }
-    if (!check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * epoch_count * stamps_per_epoch), "cudaMalloc stamps")) {
-        cudaFree(d_epoch_counter);
+    if (!check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * checkpoint_count * stamps_per_checkpoint), "cudaMalloc stamps")) {
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
     if (!check_cuda(cudaMalloc(&d_stamp_counter, sizeof(uint32_t)), "cudaMalloc stamp counter")) {
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
     if (!check_cuda(cudaMemset(d_stamp_counter, 0, sizeof(uint32_t)), "memset stamp counter")) {
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -85,20 +85,20 @@ int main() {
     if (!check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate")) {
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.enable_graph_stamps = true;
     cfg.graph_stamps = d_stamps;
@@ -108,7 +108,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -119,7 +119,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -129,22 +129,22 @@ int main() {
         std::printf("begin_capture failed\n");
         recorder.shutdown();
         cudaStreamDestroy(stream);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
 
     const uint32_t threads = 256;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, d_epoch_counter);
-    if (!recorder.capture_epoch(stream)) {
-        std::printf("capture_epoch failed during graph capture\n");
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, d_checkpoint_counter);
+    if (!recorder.capture_checkpoint(stream)) {
+        std::printf("capture_checkpoint failed during graph capture\n");
         graph.destroy();
         recorder.shutdown();
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -156,7 +156,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -170,7 +170,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -178,8 +178,8 @@ int main() {
     tt::TraceCollector trace;
     const auto trace_start = std::chrono::steady_clock::now();
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        set_epoch_kernel<<<1, 1, 0, stream>>>(d_epoch_counter, epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        set_checkpoint_kernel<<<1, 1, 0, stream>>>(d_checkpoint_counter, checkpoint);
         auto cpu_start = std::chrono::steady_clock::now();
         if (!check_cuda(cudaEventRecord(event_start, stream), "event record start")) {
             cudaEventDestroy(event_end);
@@ -189,12 +189,12 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
         if (!graph.launch(stream)) {
-            std::printf("graph launch failed at epoch %u\n", epoch);
+            std::printf("graph launch failed at checkpoint %u\n", checkpoint);
             cudaEventDestroy(event_end);
             cudaEventDestroy(event_start);
             graph.destroy();
@@ -202,7 +202,7 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
@@ -214,7 +214,7 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
@@ -226,7 +226,7 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
@@ -239,7 +239,7 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
@@ -251,7 +251,7 @@ int main() {
         graph_event.dur_us = static_cast<double>(elapsed_ms) * 1000.0;
         graph_event.pid = 1;
         graph_event.tid = 0;
-        graph_event.args.push_back({"epoch_id", std::to_string(epoch), false});
+        graph_event.args.push_back({"checkpoint_id", std::to_string(checkpoint), false});
         trace.add_event(graph_event);
     }
 
@@ -263,7 +263,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -278,7 +278,7 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -291,7 +291,7 @@ int main() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return 1;
         }
@@ -304,24 +304,24 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
     const double cycles_to_us = 1000.0 / static_cast<double>(clock_rate_khz);
 
-    std::vector<tt::EpochRecord> epochs;
-    recorder.read_epochs_to_host(epochs);
+    std::vector<tt::CheckpointRecord> checkpoints;
+    recorder.read_checkpoints_to_host(checkpoints);
     const uint64_t base_stamp = host_stamps.empty() ? 0u : host_stamps[0];
-    const uint32_t epoch_samples = stamp_count / stamps_per_epoch;
-    for (uint32_t i = 0; i < epoch_samples; ++i) {
-        const uint64_t start_stamp = host_stamps[i * stamps_per_epoch + 0];
-        const uint64_t mid_stamp = host_stamps[i * stamps_per_epoch + 1];
-        const uint64_t end_stamp = host_stamps[i * stamps_per_epoch + 2];
-        const uint32_t epoch_id = i;
+    const uint32_t checkpoint_samples = stamp_count / stamps_per_checkpoint;
+    for (uint32_t i = 0; i < checkpoint_samples; ++i) {
+        const uint64_t start_stamp = host_stamps[i * stamps_per_checkpoint + 0];
+        const uint64_t mid_stamp = host_stamps[i * stamps_per_checkpoint + 1];
+        const uint64_t end_stamp = host_stamps[i * stamps_per_checkpoint + 2];
+        const uint32_t checkpoint_id = i;
         uint32_t ring_bytes_written = 0;
-        for (const auto& record : epochs) {
-            if (record.epoch_id == epoch_id) {
+        for (const auto& record : checkpoints) {
+            if (record.checkpoint_id == checkpoint_id) {
                 ring_bytes_written = record.reserved0;
                 break;
             }
@@ -330,39 +330,39 @@ int main() {
         const double mid_us = static_cast<double>(mid_stamp - base_stamp) * cycles_to_us;
         const double end_us = static_cast<double>(end_stamp - base_stamp) * cycles_to_us;
 
-        tt::TraceEvent epoch_total{};
-        epoch_total.name = "epoch_total";
-        epoch_total.cat = "epoch";
-        epoch_total.ts_us = start_us;
-        epoch_total.dur_us = end_us - start_us;
-        epoch_total.pid = 1;
-        epoch_total.tid = 1;
-        epoch_total.args.push_back({"epoch_id", std::to_string(epoch_id), false});
-        epoch_total.args.push_back({"ring_bytes_written", std::to_string(ring_bytes_written), false});
-        trace.add_event(epoch_total);
+        tt::TraceEvent checkpoint_total{};
+        checkpoint_total.name = "checkpoint_total";
+        checkpoint_total.cat = "checkpoint";
+        checkpoint_total.ts_us = start_us;
+        checkpoint_total.dur_us = end_us - start_us;
+        checkpoint_total.pid = 1;
+        checkpoint_total.tid = 1;
+        checkpoint_total.args.push_back({"checkpoint_id", std::to_string(checkpoint_id), false});
+        checkpoint_total.args.push_back({"ring_bytes_written", std::to_string(ring_bytes_written), false});
+        trace.add_event(checkpoint_total);
 
-        tt::TraceEvent epoch_regions{};
-        epoch_regions.name = "epoch_regions";
-        epoch_regions.cat = "epoch";
-        epoch_regions.ts_us = start_us;
-        epoch_regions.dur_us = mid_us - start_us;
-        epoch_regions.pid = 1;
-        epoch_regions.tid = 1;
-        epoch_regions.args.push_back({"epoch_id", std::to_string(epoch_id), false});
-        trace.add_event(epoch_regions);
+        tt::TraceEvent checkpoint_regions{};
+        checkpoint_regions.name = "checkpoint_regions";
+        checkpoint_regions.cat = "checkpoint";
+        checkpoint_regions.ts_us = start_us;
+        checkpoint_regions.dur_us = mid_us - start_us;
+        checkpoint_regions.pid = 1;
+        checkpoint_regions.tid = 1;
+        checkpoint_regions.args.push_back({"checkpoint_id", std::to_string(checkpoint_id), false});
+        trace.add_event(checkpoint_regions);
     }
 
     tt::GetCuptiKernelTracer().append_kernel_events(trace);
     trace.write("trace/tt_trace.json");
 
-    if (!recorder.rewind_to_epoch(target_epoch, stream)) {
-        std::printf("rewind_to_epoch failed\n");
+    if (!recorder.rewind_to_checkpoint(target_checkpoint, stream)) {
+        std::printf("rewind_to_checkpoint failed\n");
         graph.destroy();
         recorder.shutdown();
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
@@ -374,18 +374,18 @@ int main() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return 1;
     }
 
-    bool ok = verify_pattern(host_out, target_epoch);
+    bool ok = verify_pattern(host_out, target_checkpoint);
     graph.destroy();
     recorder.shutdown();
     cudaStreamDestroy(stream);
     cudaFree(d_stamp_counter);
     cudaFree(d_stamps);
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
 
     if (!ok) {

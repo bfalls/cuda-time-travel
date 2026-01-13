@@ -21,7 +21,7 @@ bool check_cuda(cudaError_t err, const char* label) {
     return false;
 }
 
-__global__ void set_epoch_kernel(uint32_t* counter, uint32_t value) {
+__global__ void set_checkpoint_kernel(uint32_t* counter, uint32_t value) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *counter = value;
     }
@@ -30,8 +30,8 @@ __global__ void set_epoch_kernel(uint32_t* counter, uint32_t value) {
 __global__ void write_pattern_kernel(uint32_t* data, uint32_t count, const uint32_t* counter) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count) {
-        const uint32_t epoch = *counter;
-        data[idx] = epoch ^ (idx * 2654435761u);
+        const uint32_t checkpoint = *counter;
+        data[idx] = checkpoint ^ (idx * 2654435761u);
     }
 }
 
@@ -39,16 +39,16 @@ __global__ void write_pattern_iter_kernel(uint32_t* data, uint32_t count, const 
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count && params) {
         const uint32_t mix = (idx * 2654435761u) ^ params->seed;
-        const uint32_t value = params->epoch ^ mix;
+        const uint32_t value = params->checkpoint ^ mix;
         data[idx] = (params->flags & 1u) ? ~value : value;
     }
 }
 
-__global__ void write_pattern_patch_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+__global__ void write_pattern_patch_kernel(uint32_t* data, uint32_t count, uint32_t checkpoint, uint32_t seed) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count) {
         const uint32_t mix = (idx * 2654435761u) ^ seed;
-        data[idx] = epoch ^ mix;
+        data[idx] = checkpoint ^ mix;
     }
 }
 
@@ -99,10 +99,10 @@ bool verify_pattern(const std::vector<uint32_t>& data, uint32_t seed) {
     return true;
 }
 
-bool verify_pattern_params(const std::vector<uint32_t>& data, uint32_t epoch, uint32_t seed, uint32_t flags) {
+bool verify_pattern_params(const std::vector<uint32_t>& data, uint32_t checkpoint, uint32_t seed, uint32_t flags) {
     for (size_t i = 0; i < data.size(); ++i) {
         const uint32_t mix = (static_cast<uint32_t>(i) * 2654435761u) ^ seed;
-        const uint32_t expected = epoch ^ mix;
+        const uint32_t expected = checkpoint ^ mix;
         const uint32_t value = (flags & 1u) ? ~expected : expected;
         if (data[i] != value) {
             return false;
@@ -111,13 +111,13 @@ bool verify_pattern_params(const std::vector<uint32_t>& data, uint32_t epoch, ui
     return true;
 }
 
-void mutate_words(std::vector<uint32_t>& data, uint32_t epoch) {
+void mutate_words(std::vector<uint32_t>& data, uint32_t checkpoint) {
     if (data.empty()) {
         return;
     }
     for (uint32_t j = 0; j < 4; ++j) {
-        uint32_t index = (epoch * 7u + j * 13u) % static_cast<uint32_t>(data.size());
-        data[index] ^= 0xA5A50000u + epoch * 17u + j;
+        uint32_t index = (checkpoint * 7u + j * 13u) % static_cast<uint32_t>(data.size());
+        data[index] ^= 0xA5A50000u + checkpoint * 17u + j;
     }
 }
 
@@ -134,45 +134,45 @@ uint32_t get_env_u32(const char* name, uint32_t fallback) {
     return static_cast<uint32_t>(parsed);
 }
 
-__host__ __device__ uint32_t multistream_pattern(uint32_t epoch, uint32_t seed, uint32_t idx) {
-    return epoch ^ seed ^ (idx * 2654435761u);
+__host__ __device__ uint32_t multistream_pattern(uint32_t checkpoint, uint32_t seed, uint32_t idx) {
+    return checkpoint ^ seed ^ (idx * 2654435761u);
 }
 
-__host__ __device__ uint32_t multistream_commit(uint32_t epoch, uint32_t seed) {
-    return epoch ^ seed ^ 0xA5A5A5A5u;
+__host__ __device__ uint32_t multistream_commit(uint32_t checkpoint, uint32_t seed) {
+    return checkpoint ^ seed ^ 0xA5A5A5A5u;
 }
 
-__global__ void write_region_data_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+__global__ void write_region_data_kernel(uint32_t* data, uint32_t count, uint32_t checkpoint, uint32_t seed) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (count == 0u) {
         return;
     }
     const uint32_t commit_index = count - 1u;
     if (idx < commit_index) {
-        data[idx] = multistream_pattern(epoch, seed, idx);
+        data[idx] = multistream_pattern(checkpoint, seed, idx);
     }
 }
 
-__global__ void write_commit_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+__global__ void write_commit_kernel(uint32_t* data, uint32_t count, uint32_t checkpoint, uint32_t seed) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         if (count == 0u) {
             return;
         }
-        data[count - 1u] = multistream_commit(epoch, seed);
+        data[count - 1u] = multistream_commit(checkpoint, seed);
     }
 }
 
-bool verify_multistream_region(const std::vector<uint32_t>& data, uint32_t epoch, uint32_t seed) {
+bool verify_multistream_region(const std::vector<uint32_t>& data, uint32_t checkpoint, uint32_t seed) {
     if (data.size() < 2) {
         return false;
     }
     const uint32_t commit_index = static_cast<uint32_t>(data.size() - 1u);
     for (uint32_t i = 0; i < commit_index; ++i) {
-        if (data[i] != multistream_pattern(epoch, seed, i)) {
+        if (data[i] != multistream_pattern(checkpoint, seed, i)) {
             return false;
         }
     }
-    return data[commit_index] == multistream_commit(epoch, seed);
+    return data[commit_index] == multistream_commit(checkpoint, seed);
 }
 
 bool test_single_region() {
@@ -193,9 +193,9 @@ bool test_single_region() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 4096;
-    cfg.epoch_capacity = 8;
+    cfg.checkpoint_capacity = 8;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -214,7 +214,7 @@ bool test_single_region() {
         return false;
     }
 
-    if (!recorder.capture_epoch(0)) {
+    if (!recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -226,13 +226,13 @@ bool test_single_region() {
         return false;
     }
 
-    if (!recorder.capture_epoch(0)) {
+    if (!recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
     }
 
-    if (!recorder.rewind_to_epoch(0, 0)) {
+    if (!recorder.rewind_to_checkpoint(0, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -280,9 +280,9 @@ bool test_two_regions() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 8192;
-    cfg.epoch_capacity = 8;
+    cfg.checkpoint_capacity = 8;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer_b);
@@ -316,7 +316,7 @@ bool test_two_regions() {
         return false;
     }
 
-    if (!recorder.capture_epoch(0)) {
+    if (!recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer_b);
         cudaFree(d_buffer_a);
@@ -336,14 +336,14 @@ bool test_two_regions() {
         return false;
     }
 
-    if (!recorder.capture_epoch(0)) {
+    if (!recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer_b);
         cudaFree(d_buffer_a);
         return false;
     }
 
-    if (!recorder.rewind_to_epoch(0, 0)) {
+    if (!recorder.rewind_to_checkpoint(0, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer_b);
         cudaFree(d_buffer_a);
@@ -373,7 +373,7 @@ bool test_two_regions() {
 bool test_delta_single_region() {
     const uint32_t element_count = 512;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 16;
+    const uint32_t checkpoint_count = 16;
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc delta")) {
@@ -383,9 +383,9 @@ bool test_delta_single_region() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 65536;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -405,28 +405,28 @@ bool test_delta_single_region() {
 
     std::vector<uint32_t> host_model(element_count);
     std::vector<uint32_t> host_out(element_count);
-    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+    std::vector<std::vector<uint32_t>> expected(checkpoint_count, std::vector<uint32_t>(element_count));
 
     fill_pattern(host_model, 0x12345678u);
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (epoch != 0) {
-            mutate_words(host_model, epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (checkpoint != 0) {
+            mutate_words(host_model, checkpoint);
         }
         if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy delta in")) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        if (!recorder.capture_epoch(0)) {
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        expected[epoch] = host_model;
+        expected[checkpoint] = host_model;
     }
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (!recorder.rewind_to_epoch(epoch, 0)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (!recorder.rewind_to_checkpoint(checkpoint, 0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
@@ -436,7 +436,7 @@ bool test_delta_single_region() {
             cudaFree(d_buffer);
             return false;
         }
-        if (host_out != expected[epoch]) {
+        if (host_out != expected[checkpoint]) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
@@ -451,8 +451,8 @@ bool test_delta_single_region() {
 bool test_wrap_marker() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 6;
-    const uint32_t target_epoch = 4;
+    const uint32_t checkpoint_count = 6;
+    const uint32_t target_checkpoint = 4;
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc wrap")) {
@@ -462,9 +462,9 @@ bool test_wrap_marker() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 4096;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -479,24 +479,24 @@ bool test_wrap_marker() {
 
     std::vector<uint32_t> host_model(element_count);
     std::vector<uint32_t> host_out(element_count);
-    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+    std::vector<std::vector<uint32_t>> expected(checkpoint_count, std::vector<uint32_t>(element_count));
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_model, 0xCAFE0000u + epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_model, 0xCAFE0000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy wrap in")) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        if (!recorder.capture_epoch(0)) {
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        expected[epoch] = host_model;
+        expected[checkpoint] = host_model;
     }
 
-    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+    if (!recorder.rewind_to_checkpoint(target_checkpoint, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -506,7 +506,7 @@ bool test_wrap_marker() {
         cudaFree(d_buffer);
         return false;
     }
-    if (host_out != expected[target_epoch]) {
+    if (host_out != expected[target_checkpoint]) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -520,8 +520,8 @@ bool test_wrap_marker() {
 bool test_tiny_ring_wrap() {
     const uint32_t element_count = 64;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 5;
-    const uint32_t target_epoch = epoch_count - 1;
+    const uint32_t checkpoint_count = 5;
+    const uint32_t target_checkpoint = checkpoint_count - 1;
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc tiny wrap")) {
@@ -531,9 +531,9 @@ bool test_tiny_ring_wrap() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 640;
-    cfg.epoch_capacity = 8;
+    cfg.checkpoint_capacity = 8;
     cfg.region_capacity = 2;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -550,24 +550,24 @@ bool test_tiny_ring_wrap() {
     std::vector<uint32_t> host_out(element_count);
     std::vector<uint32_t> expected_last(element_count);
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_model, 0xBEEF0000u + epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_model, 0xBEEF0000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy tiny wrap in")) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        if (!recorder.capture_epoch(0)) {
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        if (epoch == target_epoch) {
+        if (checkpoint == target_checkpoint) {
             expected_last = host_model;
         }
     }
 
-    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+    if (!recorder.rewind_to_checkpoint(target_checkpoint, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -591,7 +591,7 @@ bool test_tiny_ring_wrap() {
 bool test_overwrite_retention() {
     const uint32_t element_count = 64;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 6;
+    const uint32_t checkpoint_count = 6;
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc retention")) {
@@ -601,9 +601,9 @@ bool test_overwrite_retention() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 4096;
-    cfg.epoch_capacity = 8;
+    cfg.checkpoint_capacity = 8;
     cfg.region_capacity = 2;
-    cfg.retention_epochs = 3;
+    cfg.retention_checkpoints = 3;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -618,30 +618,30 @@ bool test_overwrite_retention() {
 
     std::vector<uint32_t> host_model(element_count);
     std::vector<uint32_t> host_out(element_count);
-    std::vector<std::vector<uint32_t>> expected(epoch_count, std::vector<uint32_t>(element_count));
+    std::vector<std::vector<uint32_t>> expected(checkpoint_count, std::vector<uint32_t>(element_count));
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_model, 0xABCD0000u + epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_model, 0xABCD0000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy retention in")) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        if (!recorder.capture_epoch(0)) {
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
-        expected[epoch] = host_model;
+        expected[checkpoint] = host_model;
     }
 
-    if (recorder.rewind_to_epoch(2, 0)) {
+    if (recorder.rewind_to_checkpoint(2, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
     }
 
-    if (!recorder.rewind_to_epoch(4, 0)) {
+    if (!recorder.rewind_to_checkpoint(4, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -674,9 +674,9 @@ bool test_backpressure() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 320;
-    cfg.epoch_capacity = 4;
+    cfg.checkpoint_capacity = 4;
     cfg.region_capacity = 2;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kBackpressure;
     if (!recorder.init(cfg)) {
         cudaFree(d_buffer);
@@ -700,7 +700,7 @@ bool test_backpressure() {
         cudaFree(d_buffer);
         return false;
     }
-    if (!recorder.capture_epoch(0)) {
+    if (!recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -711,13 +711,13 @@ bool test_backpressure() {
         cudaFree(d_buffer);
         return false;
     }
-    if (recorder.capture_epoch(0)) {
+    if (recorder.capture_checkpoint(0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
     }
 
-    if (!recorder.rewind_to_epoch(0, 0)) {
+    if (!recorder.rewind_to_checkpoint(0, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -741,35 +741,35 @@ bool test_backpressure() {
 bool test_graph_capture_and_trace() {
     const uint32_t element_count = 512;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 4;
-    const uint32_t stamps_per_epoch = 3;
+    const uint32_t checkpoint_count = 4;
+    const uint32_t stamps_per_checkpoint = 3;
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     uint64_t* d_stamps = nullptr;
     uint32_t* d_stamp_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc graph buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc graph epoch counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc graph checkpoint counter")) {
         cudaFree(d_buffer);
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * epoch_count * stamps_per_epoch), "cudaMalloc graph stamps")) {
-        cudaFree(d_epoch_counter);
+    if (!check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * checkpoint_count * stamps_per_checkpoint), "cudaMalloc graph stamps")) {
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!check_cuda(cudaMalloc(&d_stamp_counter, sizeof(uint32_t)), "cudaMalloc graph stamp counter")) {
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!check_cuda(cudaMemset(d_stamp_counter, 0, sizeof(uint32_t)), "memset graph stamp counter")) {
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -778,20 +778,20 @@ bool test_graph_capture_and_trace() {
     if (!check_cuda(cudaStreamCreate(&stream), "cudaStreamCreate graph")) {
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.enable_graph_stamps = true;
     cfg.graph_stamps = d_stamps;
@@ -800,7 +800,7 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -810,7 +810,7 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -821,21 +821,21 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t threads = 256;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, d_epoch_counter);
-    if (!recorder.capture_epoch(stream)) {
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer, element_count, d_checkpoint_counter);
+    if (!recorder.capture_checkpoint(stream)) {
         graph.destroy();
         recorder.shutdown();
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -845,20 +845,20 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        set_epoch_kernel<<<1, 1, 0, stream>>>(d_epoch_counter, epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        set_checkpoint_kernel<<<1, 1, 0, stream>>>(d_checkpoint_counter, checkpoint);
         if (!graph.launch(stream)) {
             graph.destroy();
             recorder.shutdown();
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
@@ -869,19 +869,19 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (!recorder.rewind_to_epoch(epoch, stream)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (!recorder.rewind_to_checkpoint(checkpoint, stream)) {
             graph.destroy();
             recorder.shutdown();
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
@@ -892,17 +892,17 @@ bool test_graph_capture_and_trace() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
-        if (!verify_pattern(host_out, epoch)) {
+        if (!verify_pattern(host_out, checkpoint)) {
             graph.destroy();
             recorder.shutdown();
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
@@ -915,7 +915,7 @@ bool test_graph_capture_and_trace() {
         cudaStreamDestroy(stream);
         cudaFree(d_stamp_counter);
         cudaFree(d_stamps);
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -927,7 +927,7 @@ bool test_graph_capture_and_trace() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
@@ -943,28 +943,28 @@ bool test_graph_capture_and_trace() {
             cudaStreamDestroy(stream);
             cudaFree(d_stamp_counter);
             cudaFree(d_stamps);
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
         const double cycles_to_us = 1000.0 / static_cast<double>(clock_rate_khz);
-        const uint32_t epoch_samples = stamp_count / stamps_per_epoch;
-        for (uint32_t i = 0; i < epoch_samples; ++i) {
-            const uint64_t start_stamp = host_stamps[i * stamps_per_epoch + 0];
-            const uint64_t end_stamp = host_stamps[i * stamps_per_epoch + 2];
+        const uint32_t checkpoint_samples = stamp_count / stamps_per_checkpoint;
+        for (uint32_t i = 0; i < checkpoint_samples; ++i) {
+            const uint64_t start_stamp = host_stamps[i * stamps_per_checkpoint + 0];
+            const uint64_t end_stamp = host_stamps[i * stamps_per_checkpoint + 2];
             tt::TraceEvent event{};
-            event.name = "epoch_total";
-            event.cat = "epoch";
+            event.name = "checkpoint_total";
+            event.cat = "checkpoint";
             event.ts_us = static_cast<double>(start_stamp - base_stamp) * cycles_to_us;
             event.dur_us = static_cast<double>(end_stamp - start_stamp) * cycles_to_us;
             event.pid = 1;
             event.tid = 1;
-            event.args.push_back({"epoch_id", std::to_string(i), false});
+            event.args.push_back({"checkpoint_id", std::to_string(i), false});
             trace.add_event(event);
         }
     }
 
-    trace.add_event({"graph_launch", "graph", 0.0, 1.0, 1, 0, {{"epoch_id", "0", false}}});
+    trace.add_event({"graph_launch", "graph", 0.0, 1.0, 1, 0, {{"checkpoint_id", "0", false}}});
     tt::GetCuptiKernelTracer().append_kernel_events(trace);
     trace.write("trace/tt_trace.json");
 
@@ -974,7 +974,7 @@ bool test_graph_capture_and_trace() {
     cudaStreamDestroy(stream);
     cudaFree(d_stamp_counter);
     cudaFree(d_stamps);
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
     return valid_trace;
 }
@@ -1018,11 +1018,11 @@ bool test_graph_iter_params_update() {
         return false;
     }
 
-    for (uint32_t epoch = 0; epoch < 3; ++epoch) {
+    for (uint32_t checkpoint = 0; checkpoint < 3; ++checkpoint) {
         tt::IterParams host_params{};
-        host_params.epoch = epoch;
-        host_params.seed = 0x55u + epoch;
-        host_params.flags = epoch & 1u;
+        host_params.checkpoint = checkpoint;
+        host_params.seed = 0x55u + checkpoint;
+        host_params.flags = checkpoint & 1u;
         if (!check_cuda(cudaMemcpyAsync(d_params,
                 &host_params,
                 sizeof(tt::IterParams),
@@ -1057,7 +1057,7 @@ bool test_graph_iter_params_update() {
             cudaFree(d_buffer);
             return false;
         }
-        if (!verify_pattern_params(host_out, host_params.epoch, host_params.seed, host_params.flags)) {
+        if (!verify_pattern_params(host_out, host_params.checkpoint, host_params.seed, host_params.flags)) {
             graph.destroy();
             cudaStreamDestroy(stream);
             cudaFree(d_params);
@@ -1128,10 +1128,10 @@ bool test_graph_kernel_param_patch() {
         return false;
     }
 
-    uint32_t epoch = 2;
+    uint32_t checkpoint = 2;
     uint32_t seed = 0x44u;
     uint32_t element_count_value = element_count;
-    void* kernel_args[] = {&d_buffer, &element_count_value, &epoch, &seed};
+    void* kernel_args[] = {&d_buffer, &element_count_value, &checkpoint, &seed};
     params.kernelParams = kernel_args;
     tt::GraphUpdateStatus status{};
     if (!graph.update_kernel_node_params(node_id, params, &status)) {
@@ -1157,16 +1157,16 @@ bool test_graph_kernel_param_patch() {
         cudaFree(d_buffer);
         return false;
     }
-    if (!verify_pattern_params(host_out, epoch, seed, 0u)) {
+    if (!verify_pattern_params(host_out, checkpoint, seed, 0u)) {
         graph.destroy();
         cudaStreamDestroy(stream);
         cudaFree(d_buffer);
         return false;
     }
 
-    epoch = 5;
+    checkpoint = 5;
     seed = 0x99u;
-    void* kernel_args2[] = {&d_buffer, &element_count_value, &epoch, &seed};
+    void* kernel_args2[] = {&d_buffer, &element_count_value, &checkpoint, &seed};
     params.kernelParams = kernel_args2;
     if (!graph.update_kernel_node_params(node_id, params, &status)) {
         std::printf("test_graph_kernel_param_patch skipped: %s (%s)\n",
@@ -1189,7 +1189,7 @@ bool test_graph_kernel_param_patch() {
         cudaFree(d_buffer);
         return false;
     }
-    if (!verify_pattern_params(host_out, epoch, seed, 0u)) {
+    if (!verify_pattern_params(host_out, checkpoint, seed, 0u)) {
         graph.destroy();
         cudaStreamDestroy(stream);
         cudaFree(d_buffer);
@@ -1205,18 +1205,18 @@ bool test_graph_kernel_param_patch() {
 bool test_graph_control_updates() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 6;
-    const uint32_t stamps_per_epoch = 3;
+    const uint32_t checkpoint_count = 6;
+    const uint32_t stamps_per_checkpoint = 3;
 
     uint32_t* d_buffer_a = nullptr;
     uint32_t* d_buffer_b = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     uint64_t* d_stamps = nullptr;
     uint32_t* d_stamp_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer_a, size_bytes), "cudaMalloc ctrl buffer A") ||
         !check_cuda(cudaMalloc(&d_buffer_b, size_bytes), "cudaMalloc ctrl buffer B") ||
-        !check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc ctrl epoch") ||
-        !check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * epoch_count * stamps_per_epoch), "cudaMalloc ctrl stamps") ||
+        !check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc ctrl checkpoint") ||
+        !check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * checkpoint_count * stamps_per_checkpoint), "cudaMalloc ctrl stamps") ||
         !check_cuda(cudaMalloc(&d_stamp_counter, sizeof(uint32_t)), "cudaMalloc ctrl stamp counter")) {
         return false;
     }
@@ -1230,14 +1230,14 @@ bool test_graph_control_updates() {
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.enable_graph_stamps = true;
     cfg.graph_stamps = d_stamps;
@@ -1258,9 +1258,9 @@ bool test_graph_control_updates() {
     }
     const uint32_t threads = 256;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_a, element_count, d_epoch_counter);
-    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_b, element_count, d_epoch_counter);
-    if (!recorder.capture_epoch(stream)) {
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_a, element_count, d_checkpoint_counter);
+    write_pattern_kernel<<<blocks, threads, 0, stream>>>(d_buffer_b, element_count, d_checkpoint_counter);
+    if (!recorder.capture_checkpoint(stream)) {
         graph.destroy();
         recorder.shutdown();
         return false;
@@ -1281,24 +1281,24 @@ bool test_graph_control_updates() {
         return false;
     }
 
-    std::vector<uint32_t> expected_region1(epoch_count, 0u);
-    uint32_t last_region1_epoch = 0u;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        set_epoch_kernel<<<1, 1, 0, stream>>>(d_epoch_counter, epoch);
-        if (epoch % 2 == 1) {
+    std::vector<uint32_t> expected_region1(checkpoint_count, 0u);
+    uint32_t last_region1_checkpoint = 0u;
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        set_checkpoint_kernel<<<1, 1, 0, stream>>>(d_checkpoint_counter, checkpoint);
+        if (checkpoint % 2 == 1) {
             control.region_mask = 0x1ull;
         } else {
             control.region_mask = 0x3ull;
-            last_region1_epoch = epoch;
+            last_region1_checkpoint = checkpoint;
         }
-        control.snapshot_period = (epoch % 3 == 0) ? 1u : 0u;
-        control.flags = (epoch % 2 == 0) ? tt::kGraphControlStampsEnabled : 0u;
+        control.snapshot_period = (checkpoint % 3 == 0) ? 1u : 0u;
+        control.flags = (checkpoint % 2 == 0) ? tt::kGraphControlStampsEnabled : 0u;
         if (!recorder.update_graph_control(control, stream)) {
             graph.destroy();
             recorder.shutdown();
             return false;
         }
-        expected_region1[epoch] = last_region1_epoch;
+        expected_region1[checkpoint] = last_region1_checkpoint;
         if (!graph.launch(stream)) {
             graph.destroy();
             recorder.shutdown();
@@ -1311,8 +1311,8 @@ bool test_graph_control_updates() {
         return false;
     }
 
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (!recorder.rewind_to_epoch(epoch, stream)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (!recorder.rewind_to_checkpoint(checkpoint, stream)) {
             graph.destroy();
             recorder.shutdown();
             return false;
@@ -1325,12 +1325,12 @@ bool test_graph_control_updates() {
             recorder.shutdown();
             return false;
         }
-        if (!verify_pattern(host_a, epoch)) {
+        if (!verify_pattern(host_a, checkpoint)) {
             graph.destroy();
             recorder.shutdown();
             return false;
         }
-        if (!verify_pattern(host_b, expected_region1[epoch])) {
+        if (!verify_pattern(host_b, expected_region1[checkpoint])) {
             graph.destroy();
             recorder.shutdown();
             return false;
@@ -1342,59 +1342,59 @@ bool test_graph_control_updates() {
     cudaStreamDestroy(stream);
     cudaFree(d_stamp_counter);
     cudaFree(d_stamps);
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer_b);
     cudaFree(d_buffer_a);
     return true;
 }
 
-bool run_deterministic_manifest_capture(const char* manifest_path, uint32_t epoch_count) {
+bool run_deterministic_manifest_capture(const char* manifest_path, uint32_t checkpoint_count) {
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc deterministic buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc deterministic counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc deterministic counter")) {
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     cfg.enable_manifest = true;
     if (!recorder.init(cfg)) {
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t threads = 256;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        set_epoch_kernel<<<1, 1>>>(d_epoch_counter, epoch);
-        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_epoch_counter);
-        if (!recorder.capture_epoch(0)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        set_checkpoint_kernel<<<1, 1>>>(d_checkpoint_counter, checkpoint);
+        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_checkpoint_counter);
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
-            cudaFree(d_epoch_counter);
+            cudaFree(d_checkpoint_counter);
             cudaFree(d_buffer);
             return false;
         }
@@ -1402,19 +1402,19 @@ bool run_deterministic_manifest_capture(const char* manifest_path, uint32_t epoc
 
     bool wrote_manifest = recorder.write_manifest_json(manifest_path);
     recorder.shutdown();
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
     return wrote_manifest;
 }
 
 bool test_deterministic_manifest_match() {
-    const uint32_t epoch_count = 6;
+    const uint32_t checkpoint_count = 6;
     const char* path_a = "trace/tt_manifest_a.json";
     const char* path_b = "trace/tt_manifest_b.json";
-    if (!run_deterministic_manifest_capture(path_a, epoch_count)) {
+    if (!run_deterministic_manifest_capture(path_a, checkpoint_count)) {
         return false;
     }
-    if (!run_deterministic_manifest_capture(path_b, epoch_count)) {
+    if (!run_deterministic_manifest_capture(path_b, checkpoint_count)) {
         return false;
     }
     const std::string manifest_a = read_file_bytes(path_a);
@@ -1426,16 +1426,16 @@ bool test_deterministic_manifest_match() {
 }
 
 bool run_verify_capture(tt::Recorder& recorder,
-    uint32_t epoch_count,
+    uint32_t checkpoint_count,
     uint32_t* d_buffer,
-    uint32_t* d_epoch_counter,
+    uint32_t* d_checkpoint_counter,
     uint32_t element_count) {
     const uint32_t threads = 256;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        set_epoch_kernel<<<1, 1>>>(d_epoch_counter, epoch);
-        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_epoch_counter);
-        if (!recorder.capture_epoch(0)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        set_checkpoint_kernel<<<1, 1>>>(d_checkpoint_counter, checkpoint);
+        write_pattern_kernel<<<blocks, threads>>>(d_buffer, element_count, d_checkpoint_counter);
+        if (!recorder.capture_checkpoint(0)) {
             return false;
         }
     }
@@ -1445,51 +1445,51 @@ bool run_verify_capture(tt::Recorder& recorder,
 bool test_verify_manifest_pass() {
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 5;
+    const uint32_t checkpoint_count = 5;
     const char* manifest_path = "trace/tt_manifest_verify_pass.json";
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc verify counter")) {
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     cfg.enable_manifest = true;
     if (!recorder.init(cfg)) {
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
-    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+    if (!run_verify_capture(recorder, checkpoint_count, d_buffer, d_checkpoint_counter, element_count)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.write_manifest_json(manifest_path)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -1499,7 +1499,7 @@ bool test_verify_manifest_pass() {
     bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
 
     recorder.shutdown();
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
 
     if (!ok || report.status != "pass") {
@@ -1511,58 +1511,58 @@ bool test_verify_manifest_pass() {
 bool test_verify_manifest_mismatch_localize() {
     const uint32_t element_count = 512;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 4;
+    const uint32_t checkpoint_count = 4;
     const char* manifest_path = "trace/tt_manifest_verify_fail.json";
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify fail buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify fail counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc verify fail counter")) {
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     cfg.enable_manifest = true;
     if (!recorder.init(cfg)) {
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
-    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+    if (!run_verify_capture(recorder, checkpoint_count, d_buffer, d_checkpoint_counter, element_count)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.write_manifest_json(manifest_path)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     tt::VerifyOptions options{};
     options.tamper.enabled = true;
-    options.tamper.epoch_id = 2;
+    options.tamper.checkpoint_id = 2;
     options.tamper.region_id = 0;
     options.tamper.byte_offset = 8;
     options.tamper.xor_mask = 0x1;
@@ -1571,61 +1571,61 @@ bool test_verify_manifest_mismatch_localize() {
     bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
 
     recorder.shutdown();
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
 
     return !ok && report.status == "fail" && report.has_mismatch &&
         report.first_mismatch.localized && report.first_mismatch.first_diff_offset_bytes == options.tamper.byte_offset;
 }
 
-bool test_verify_manifest_dropped_epochs_error() {
+bool test_verify_manifest_dropped_checkpoints_error() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 5;
+    const uint32_t checkpoint_count = 5;
     const char* manifest_path = "trace/tt_manifest_verify_drop.json";
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify drop buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify drop counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc verify drop counter")) {
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 2;
+    cfg.retention_checkpoints = 2;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = false;
     cfg.enable_manifest = true;
     if (!recorder.init(cfg)) {
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
-    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+    if (!run_verify_capture(recorder, checkpoint_count, d_buffer, d_checkpoint_counter, element_count)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.write_manifest_json(manifest_path)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
@@ -1635,7 +1635,7 @@ bool test_verify_manifest_dropped_epochs_error() {
     bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
 
     recorder.shutdown();
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
 
     return !ok && report.status == "error";
@@ -1644,66 +1644,66 @@ bool test_verify_manifest_dropped_epochs_error() {
 bool test_verify_manifest_subset() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 5;
+    const uint32_t checkpoint_count = 5;
     const char* manifest_path = "trace/tt_manifest_verify_subset.json";
 
     uint32_t* d_buffer = nullptr;
-    uint32_t* d_epoch_counter = nullptr;
+    uint32_t* d_checkpoint_counter = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc verify subset buffer")) {
         return false;
     }
-    if (!check_cuda(cudaMalloc(&d_epoch_counter, sizeof(uint32_t)), "cudaMalloc verify subset counter")) {
+    if (!check_cuda(cudaMalloc(&d_checkpoint_counter, sizeof(uint32_t)), "cudaMalloc verify subset counter")) {
         cudaFree(d_buffer);
         return false;
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t ring_bytes = per_chunk_bytes * epoch_count + 4096u;
+    const uint32_t ring_bytes = per_chunk_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     cfg.enable_manifest = true;
     if (!recorder.init(cfg)) {
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.register_region(0, d_buffer, size_bytes, 1)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
-    if (!run_verify_capture(recorder, epoch_count, d_buffer, d_epoch_counter, element_count)) {
+    if (!run_verify_capture(recorder, checkpoint_count, d_buffer, d_checkpoint_counter, element_count)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
     if (!recorder.write_manifest_json(manifest_path)) {
         recorder.shutdown();
-        cudaFree(d_epoch_counter);
+        cudaFree(d_checkpoint_counter);
         cudaFree(d_buffer);
         return false;
     }
 
     tt::VerifyOptions options{};
-    options.epoch_range_set = true;
-    options.epoch_begin = 1;
-    options.epoch_end = 3;
+    options.checkpoint_range_set = true;
+    options.checkpoint_begin = 1;
+    options.checkpoint_end = 3;
     options.region_ids.push_back(0);
 
     tt::VerifyReport report{};
     bool ok = recorder.verify_manifest_json(manifest_path, options, &report);
 
     recorder.shutdown();
-    cudaFree(d_epoch_counter);
+    cudaFree(d_checkpoint_counter);
     cudaFree(d_buffer);
 
     return ok && report.status == "pass";
@@ -1712,8 +1712,8 @@ bool test_verify_manifest_subset() {
 bool test_deterministic_rewind() {
     const uint32_t element_count = 512;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 5;
-    const uint32_t target_epoch = 3;
+    const uint32_t checkpoint_count = 5;
+    const uint32_t target_checkpoint = 3;
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc deterministic rewind")) {
@@ -1723,9 +1723,9 @@ bool test_deterministic_rewind() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = 65536;
-    cfg.epoch_capacity = 16;
+    cfg.checkpoint_capacity = 16;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     if (!recorder.init(cfg)) {
@@ -1741,9 +1741,9 @@ bool test_deterministic_rewind() {
     std::vector<uint32_t> host_model(element_count);
     std::vector<uint32_t> host_out(element_count);
     std::vector<uint32_t> expected(element_count);
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_model, 0xBEEF0000u + epoch);
-        if (epoch == target_epoch) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_model, 0xBEEF0000u + checkpoint);
+        if (checkpoint == target_checkpoint) {
             expected = host_model;
         }
         if (!check_cuda(cudaMemcpy(d_buffer, host_model.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy deterministic in")) {
@@ -1751,14 +1751,14 @@ bool test_deterministic_rewind() {
             cudaFree(d_buffer);
             return false;
         }
-        if (!recorder.capture_epoch(0)) {
+        if (!recorder.capture_checkpoint(0)) {
             recorder.shutdown();
             cudaFree(d_buffer);
             return false;
         }
     }
 
-    if (!recorder.rewind_to_epoch(target_epoch, 0)) {
+    if (!recorder.rewind_to_checkpoint(target_checkpoint, 0)) {
         recorder.shutdown();
         cudaFree(d_buffer);
         return false;
@@ -1783,7 +1783,7 @@ bool test_deterministic_rewind() {
 bool test_multistream_no_deps_failure() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+    const uint32_t checkpoint_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc multistream buffer")) {
@@ -1802,10 +1802,10 @@ bool test_multistream_no_deps_failure() {
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
-    cfg.ring_bytes = size_bytes * (epoch_count + 2u) + 4096u;
-    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.ring_bytes = size_bytes * (checkpoint_count + 2u) + 4096u;
+    cfg.checkpoint_capacity = checkpoint_count + 2u;
     cfg.region_capacity = 1;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaEventDestroy(data_event);
@@ -1826,11 +1826,11 @@ bool test_multistream_no_deps_failure() {
     const uint32_t seed = 0xABCDEF01u;
     const uint32_t threads = 128;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
         write_region_data_kernel<<<blocks, threads, 0, producer_stream>>>(
             static_cast<uint32_t*>(d_buffer),
             element_count,
-            epoch,
+            checkpoint,
             seed);
         if (!check_cuda(cudaGetLastError(), "launch data kernel")) {
             recorder.shutdown();
@@ -1857,7 +1857,7 @@ bool test_multistream_no_deps_failure() {
             return false;
         }
 
-        if (!recorder.capture_epoch(capture_stream)) {
+        if (!recorder.capture_checkpoint(capture_stream)) {
             recorder.shutdown();
             cudaEventDestroy(data_event);
             cudaStreamDestroy(capture_stream);
@@ -1869,7 +1869,7 @@ bool test_multistream_no_deps_failure() {
         write_commit_kernel<<<1, 1, 0, producer_stream>>>(
             static_cast<uint32_t*>(d_buffer),
             element_count,
-            epoch,
+            checkpoint,
             seed);
         if (!check_cuda(cudaGetLastError(), "launch commit kernel")) {
             recorder.shutdown();
@@ -1891,8 +1891,8 @@ bool test_multistream_no_deps_failure() {
 
     std::vector<uint32_t> host_data(element_count, 0u);
     uint32_t mismatches = 0;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (!recorder.rewind_to_epoch(epoch, capture_stream)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (!recorder.rewind_to_checkpoint(checkpoint, capture_stream)) {
             recorder.shutdown();
             cudaEventDestroy(data_event);
             cudaStreamDestroy(capture_stream);
@@ -1908,7 +1908,7 @@ bool test_multistream_no_deps_failure() {
             cudaFree(d_buffer);
             return false;
         }
-        if (!verify_multistream_region(host_data, epoch, seed)) {
+        if (!verify_multistream_region(host_data, checkpoint, seed)) {
             ++mismatches;
         }
     }
@@ -1925,7 +1925,7 @@ bool test_multistream_no_deps_failure() {
 bool test_multistream_with_deps_success() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+    const uint32_t checkpoint_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
 
     void* d_buffer = nullptr;
     if (!check_cuda(cudaMalloc(&d_buffer, size_bytes), "cudaMalloc multistream buffer deps")) {
@@ -1944,10 +1944,10 @@ bool test_multistream_with_deps_success() {
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
-    cfg.ring_bytes = size_bytes * (epoch_count + 2u) + 4096u;
-    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.ring_bytes = size_bytes * (checkpoint_count + 2u) + 4096u;
+    cfg.checkpoint_capacity = checkpoint_count + 2u;
     cfg.region_capacity = 1;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         cudaEventDestroy(commit_event);
@@ -1971,11 +1971,11 @@ bool test_multistream_with_deps_success() {
     tt::CaptureDependency dep{};
     dep.region_id = 0;
     dep.producer_stream = producer_stream;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
         write_region_data_kernel<<<blocks, threads, 0, producer_stream>>>(
             static_cast<uint32_t*>(d_buffer),
             element_count,
-            epoch,
+            checkpoint,
             seed);
         if (!check_cuda(cudaGetLastError(), "launch data kernel deps")) {
             recorder.shutdown();
@@ -1988,7 +1988,7 @@ bool test_multistream_with_deps_success() {
         write_commit_kernel<<<1, 1, 0, producer_stream>>>(
             static_cast<uint32_t*>(d_buffer),
             element_count,
-            epoch,
+            checkpoint,
             seed);
         if (!check_cuda(cudaGetLastError(), "launch commit kernel deps")) {
             recorder.shutdown();
@@ -2009,7 +2009,7 @@ bool test_multistream_with_deps_success() {
 
         dep.event = commit_event;
         tt::CaptureDeps deps{&dep, 1};
-        if (!recorder.capture_epoch(capture_stream, deps)) {
+        if (!recorder.capture_checkpoint(capture_stream, deps)) {
             recorder.shutdown();
             cudaEventDestroy(commit_event);
             cudaStreamDestroy(capture_stream);
@@ -2029,8 +2029,8 @@ bool test_multistream_with_deps_success() {
 
     std::vector<uint32_t> host_data(element_count, 0u);
     bool ok = true;
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        if (!recorder.rewind_to_epoch(epoch, capture_stream)) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        if (!recorder.rewind_to_checkpoint(checkpoint, capture_stream)) {
             ok = false;
             break;
         }
@@ -2038,7 +2038,7 @@ bool test_multistream_with_deps_success() {
             ok = false;
             break;
         }
-        if (!verify_multistream_region(host_data, epoch, seed)) {
+        if (!verify_multistream_region(host_data, checkpoint, seed)) {
             ok = false;
             break;
         }
@@ -2056,7 +2056,7 @@ bool test_multistream_with_deps_success() {
 bool test_multistream_multi_region() {
     const uint32_t element_count = 256;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
+    const uint32_t checkpoint_count = get_env_u32("TT_TEST_MULTISTREAM_ITERS", 6);
 
     void* d_buffers[2]{};
     for (int i = 0; i < 2; ++i) {
@@ -2080,10 +2080,10 @@ bool test_multistream_multi_region() {
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
-    cfg.ring_bytes = size_bytes * 2u * (epoch_count + 2u) + 4096u;
-    cfg.epoch_capacity = epoch_count + 2u;
+    cfg.ring_bytes = size_bytes * 2u * (checkpoint_count + 2u) + 4096u;
+    cfg.checkpoint_capacity = checkpoint_count + 2u;
     cfg.region_capacity = 2;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     if (!recorder.init(cfg)) {
         return false;
@@ -2099,12 +2099,12 @@ bool test_multistream_multi_region() {
     const uint32_t threads = 128;
     const uint32_t blocks = (element_count + threads - 1u) / threads;
     tt::CaptureDependency deps[2]{};
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
         for (uint32_t r = 0; r < 2; ++r) {
             write_region_data_kernel<<<blocks, threads, 0, producer_streams[r]>>>(
                 static_cast<uint32_t*>(d_buffers[r]),
                 element_count,
-                epoch,
+                checkpoint,
                 seeds[r]);
             if (!check_cuda(cudaGetLastError(), "launch data kernel multi")) {
                 recorder.shutdown();
@@ -2113,7 +2113,7 @@ bool test_multistream_multi_region() {
             write_commit_kernel<<<1, 1, 0, producer_streams[r]>>>(
                 static_cast<uint32_t*>(d_buffers[r]),
                 element_count,
-                epoch,
+                checkpoint,
                 seeds[r]);
             if (!check_cuda(cudaGetLastError(), "launch commit kernel multi")) {
                 recorder.shutdown();
@@ -2129,7 +2129,7 @@ bool test_multistream_multi_region() {
         }
 
         tt::CaptureDeps dep_list{deps, 2};
-        if (!recorder.capture_epoch(capture_stream, dep_list)) {
+        if (!recorder.capture_checkpoint(capture_stream, dep_list)) {
             recorder.shutdown();
             return false;
         }
@@ -2143,8 +2143,8 @@ bool test_multistream_multi_region() {
 
     bool ok = true;
     std::vector<uint32_t> host_data(element_count, 0u);
-    const uint32_t check_epoch = epoch_count > 0 ? (epoch_count - 1u) : 0u;
-    if (!recorder.rewind_to_epoch(check_epoch, capture_stream)) {
+    const uint32_t check_checkpoint = checkpoint_count > 0 ? (checkpoint_count - 1u) : 0u;
+    if (!recorder.rewind_to_checkpoint(check_checkpoint, capture_stream)) {
         ok = false;
     } else {
         for (uint32_t r = 0; r < 2; ++r) {
@@ -2152,7 +2152,7 @@ bool test_multistream_multi_region() {
                 ok = false;
                 break;
             }
-            if (!verify_multistream_region(host_data, check_epoch, seeds[r])) {
+            if (!verify_multistream_region(host_data, check_checkpoint, seeds[r])) {
                 ok = false;
                 break;
             }
@@ -2258,9 +2258,9 @@ int main() {
         return 1;
     }
 
-    bool ok_verify_drop = test_verify_manifest_dropped_epochs_error();
+    bool ok_verify_drop = test_verify_manifest_dropped_checkpoints_error();
     if (!ok_verify_drop) {
-        std::printf("test_verify_manifest_dropped_epochs_error failed\n");
+        std::printf("test_verify_manifest_dropped_checkpoints_error failed\n");
         return 1;
     }
 

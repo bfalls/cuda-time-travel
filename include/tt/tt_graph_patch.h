@@ -6,7 +6,7 @@
 namespace tt {
 
 struct IterParams {
-    uint32_t epoch = 0;
+    uint32_t checkpoint = 0;
     uint32_t seed = 0;
     uint32_t flags = 0;
     uint32_t reserved = 0;

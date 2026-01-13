@@ -36,12 +36,12 @@ bool verify_pattern(const std::vector<uint32_t>& data, uint32_t seed) {
 int main() {
     const uint32_t element_count = 256 * 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    uint32_t epoch_count = 10;
+    uint32_t checkpoint_count = 10;
     const uint32_t snapshot_period = 4;
 
-    uint32_t ring_bytes = size_bytes * 2 * epoch_count + 4096;
+    uint32_t ring_bytes = size_bytes * 2 * checkpoint_count + 4096;
     bool enable_deltas = true;
-    uint32_t retention_epochs = 0;
+    uint32_t retention_checkpoints = 0;
     tt::OverwriteMode overwrite_mode = tt::OverwriteMode::kDropOldest;
     bool deterministic = false;
     const char* manifest_path = nullptr;
@@ -52,8 +52,8 @@ int main() {
             deterministic = true;
         } else if (std::strncmp(__argv[i], "--ring-bytes=", 13) == 0) {
             ring_bytes = static_cast<uint32_t>(std::strtoul(__argv[i] + 13, nullptr, 10));
-        } else if (std::strncmp(__argv[i], "--retention-epochs=", 19) == 0) {
-            retention_epochs = static_cast<uint32_t>(std::strtoul(__argv[i] + 19, nullptr, 10));
+        } else if (std::strncmp(__argv[i], "--retention-checkpoints=", 19) == 0) {
+            retention_checkpoints = static_cast<uint32_t>(std::strtoul(__argv[i] + 19, nullptr, 10));
         } else if (std::strncmp(__argv[i], "--overwrite-mode=", 17) == 0) {
             const char* mode = __argv[i] + 17;
             if (std::strcmp(mode, "backpressure") == 0) {
@@ -77,8 +77,8 @@ int main() {
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t per_epoch_bytes = per_chunk_bytes * 2u;
-    const uint64_t required_bytes = static_cast<uint64_t>(per_epoch_bytes) * static_cast<uint64_t>(epoch_count);
+    const uint32_t per_checkpoint_bytes = per_chunk_bytes * 2u;
+    const uint64_t required_bytes = static_cast<uint64_t>(per_checkpoint_bytes) * static_cast<uint64_t>(checkpoint_count);
     bool can_rewind = true;
     if (ring_bytes < per_chunk_bytes) {
         std::printf("ring_bytes too small for a single chunk (%u required)\n", per_chunk_bytes);
@@ -87,7 +87,7 @@ int main() {
         return 1;
     }
     if (static_cast<uint64_t>(ring_bytes) < required_bytes) {
-        std::printf("warning: ring_bytes=%u smaller than required=%llu; wrap will overwrite old epochs\n",
+        std::printf("warning: ring_bytes=%u smaller than required=%llu; wrap will overwrite old checkpoints\n",
             ring_bytes,
             static_cast<unsigned long long>(required_bytes));
         can_rewind = false;
@@ -96,9 +96,9 @@ int main() {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 8;
-    cfg.retention_epochs = retention_epochs;
+    cfg.retention_checkpoints = retention_checkpoints;
     cfg.overwrite_mode = overwrite_mode;
     cfg.deterministic = deterministic;
     cfg.enable_manifest = (manifest_path != nullptr);
@@ -124,8 +124,8 @@ int main() {
     }
 
     std::vector<uint32_t> host_buffer(element_count);
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_buffer, 0x1000u + epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_buffer, 0x1000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer_a, host_buffer.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy A")) {
             recorder.shutdown();
             cudaFree(d_buffer_b);
@@ -133,7 +133,7 @@ int main() {
             return 1;
         }
 
-        fill_pattern(host_buffer, 0x2000u + epoch);
+        fill_pattern(host_buffer, 0x2000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer_b, host_buffer.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy B")) {
             recorder.shutdown();
             cudaFree(d_buffer_b);
@@ -141,20 +141,20 @@ int main() {
             return 1;
         }
 
-        if (!recorder.capture_epoch(0)) {
-            std::printf("capture_epoch failed at %u\n", epoch);
+        if (!recorder.capture_checkpoint(0)) {
+            std::printf("capture_checkpoint failed at %u\n", checkpoint);
             recorder.shutdown();
             cudaFree(d_buffer_b);
             cudaFree(d_buffer_a);
             return 1;
         }
 
-        const bool is_snapshot = (!enable_deltas) || (snapshot_period == 0u) || ((epoch % snapshot_period) == 0u);
+        const bool is_snapshot = (!enable_deltas) || (snapshot_period == 0u) || ((checkpoint % snapshot_period) == 0u);
         const uint32_t payload_bytes = size_bytes;
         const uint32_t chunk_bytes = static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + payload_bytes;
         const uint32_t aligned_bytes = (chunk_bytes + 31u) & ~31u;
-        std::printf("epoch %u: %s payload=%u total=%u ring_bytes=%u\n",
-            epoch,
+        std::printf("checkpoint %u: %s payload=%u total=%u ring_bytes=%u\n",
+            checkpoint,
             is_snapshot ? "snapshot" : "delta",
             payload_bytes,
             aligned_bytes,
@@ -164,9 +164,9 @@ int main() {
     bool ok_a = true;
     bool ok_b = true;
     if (can_rewind) {
-        const uint32_t target_epoch = 4;
-        if (!recorder.rewind_to_epoch(target_epoch, 0)) {
-            std::printf("rewind_to_epoch failed\n");
+        const uint32_t target_checkpoint = 4;
+        if (!recorder.rewind_to_checkpoint(target_checkpoint, 0)) {
+            std::printf("rewind_to_checkpoint failed\n");
             recorder.shutdown();
             cudaFree(d_buffer_b);
             cudaFree(d_buffer_a);
@@ -180,7 +180,7 @@ int main() {
             cudaFree(d_buffer_a);
             return 1;
         }
-        ok_a = verify_pattern(host_out, 0x1000u + target_epoch);
+        ok_a = verify_pattern(host_out, 0x1000u + target_checkpoint);
 
         if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer_b, size_bytes, cudaMemcpyDeviceToHost), "memcpy out B")) {
             recorder.shutdown();
@@ -188,7 +188,7 @@ int main() {
             cudaFree(d_buffer_a);
             return 1;
         }
-        ok_b = verify_pattern(host_out, 0x2000u + target_epoch);
+        ok_b = verify_pattern(host_out, 0x2000u + target_checkpoint);
     }
 
     if (manifest_path) {

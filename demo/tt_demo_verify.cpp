@@ -25,7 +25,7 @@ void fill_pattern(std::vector<uint32_t>& data, uint32_t seed) {
 int main() {
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t epoch_count = 6;
+    const uint32_t checkpoint_count = 6;
     const uint32_t snapshot_period = 2;
     const char* manifest_path = "trace/tt_manifest_verify_demo.json";
     const char* report_pass = "trace/tt_verify_report_pass.json";
@@ -43,15 +43,15 @@ int main() {
     }
 
     const uint32_t per_chunk_bytes = (static_cast<uint32_t>(sizeof(tt::ChunkHeader)) + size_bytes + 31u) & ~31u;
-    const uint32_t per_epoch_bytes = per_chunk_bytes * 2u;
-    const uint32_t ring_bytes = per_epoch_bytes * epoch_count + 4096u;
+    const uint32_t per_checkpoint_bytes = per_chunk_bytes * 2u;
+    const uint32_t ring_bytes = per_checkpoint_bytes * checkpoint_count + 4096u;
 
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 8;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.deterministic = true;
     cfg.enable_manifest = true;
@@ -73,23 +73,23 @@ int main() {
     recorder.set_region_full_snapshot_period(1, snapshot_period);
 
     std::vector<uint32_t> host_buffer(element_count);
-    for (uint32_t epoch = 0; epoch < epoch_count; ++epoch) {
-        fill_pattern(host_buffer, 0x1000u + epoch);
+    for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
+        fill_pattern(host_buffer, 0x1000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer_a, host_buffer.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy A")) {
             recorder.shutdown();
             cudaFree(d_buffer_b);
             cudaFree(d_buffer_a);
             return 1;
         }
-        fill_pattern(host_buffer, 0x2000u + epoch);
+        fill_pattern(host_buffer, 0x2000u + checkpoint);
         if (!check_cuda(cudaMemcpy(d_buffer_b, host_buffer.data(), size_bytes, cudaMemcpyHostToDevice), "memcpy B")) {
             recorder.shutdown();
             cudaFree(d_buffer_b);
             cudaFree(d_buffer_a);
             return 1;
         }
-        if (!recorder.capture_epoch(0)) {
-            std::printf("capture_epoch failed\n");
+        if (!recorder.capture_checkpoint(0)) {
+            std::printf("capture_checkpoint failed\n");
             recorder.shutdown();
             cudaFree(d_buffer_b);
             cudaFree(d_buffer_a);
@@ -120,7 +120,7 @@ int main() {
     fail_options.trace_annotate = true;
     fail_options.trace = &trace;
     fail_options.tamper.enabled = true;
-    fail_options.tamper.epoch_id = 3;
+    fail_options.tamper.checkpoint_id = 3;
     fail_options.tamper.region_id = 1;
     fail_options.tamper.byte_offset = 8;
     fail_options.tamper.xor_mask = 0x1;

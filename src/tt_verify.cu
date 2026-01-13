@@ -346,12 +346,12 @@ static bool parse_region(JsonCursor& cursor, ManifestRegion& out, std::string& e
     return true;
 }
 
-static bool parse_epoch(JsonCursor& cursor, ManifestEpoch& out, std::string& error) {
+static bool parse_checkpoint(JsonCursor& cursor, ManifestCheckpoint& out, std::string& error) {
     if (!consume(cursor, '{')) {
-        error = "expected '{' for epoch object";
+        error = "expected '{' for checkpoint object";
         return false;
     }
-    bool has_epoch_id = false;
+    bool has_checkpoint_id = false;
     while (true) {
         skip_ws(cursor);
         const std::string& text = *cursor.text;
@@ -361,21 +361,21 @@ static bool parse_epoch(JsonCursor& cursor, ManifestEpoch& out, std::string& err
         }
         std::string key;
         if (!parse_string(cursor, key)) {
-            error = "failed to parse epoch key";
+            error = "failed to parse checkpoint key";
             return false;
         }
         if (!consume(cursor, ':')) {
-            error = "expected ':' after epoch key";
+            error = "expected ':' after checkpoint key";
             return false;
         }
-        if (key == "epoch_id") {
+        if (key == "checkpoint_id") {
             uint32_t value = 0;
             if (!parse_u32(cursor, value)) {
-                error = "failed to parse epoch_id";
+                error = "failed to parse checkpoint_id";
                 return false;
             }
-            out.epoch_id = value;
-            has_epoch_id = true;
+            out.checkpoint_id = value;
+            has_checkpoint_id = true;
         } else if (key == "ring_bytes_written") {
             uint32_t value = 0;
             if (!parse_u32(cursor, value)) {
@@ -413,7 +413,7 @@ static bool parse_epoch(JsonCursor& cursor, ManifestEpoch& out, std::string& err
             }
         } else {
             if (!skip_value(cursor)) {
-                error = "failed to skip epoch value";
+                error = "failed to skip checkpoint value";
                 return false;
             }
         }
@@ -427,20 +427,20 @@ static bool parse_epoch(JsonCursor& cursor, ManifestEpoch& out, std::string& err
             break;
         }
     }
-    if (!has_epoch_id) {
-        error = "missing epoch_id";
+    if (!has_checkpoint_id) {
+        error = "missing checkpoint_id";
         return false;
     }
     return true;
 }
 
-static bool parse_manifest_json(const std::string& text, std::vector<ManifestEpoch>& out_epochs, std::string& error) {
+static bool parse_manifest_json(const std::string& text, std::vector<ManifestCheckpoint>& out_checkpoints, std::string& error) {
     JsonCursor cursor{&text, 0};
     if (!consume(cursor, '{')) {
         error = "expected '{' at top-level";
         return false;
     }
-    bool found_epochs = false;
+    bool found_checkpoints = false;
     while (true) {
         skip_ws(cursor);
         if (cursor.pos >= text.size()) {
@@ -460,22 +460,22 @@ static bool parse_manifest_json(const std::string& text, std::vector<ManifestEpo
             error = "expected ':' after top-level key";
             return false;
         }
-        if (key == "epochs") {
+        if (key == "checkpoints") {
             if (!consume(cursor, '[')) {
-                error = "expected '[' for epochs";
+                error = "expected '[' for checkpoints";
                 return false;
             }
             skip_ws(cursor);
-            out_epochs.clear();
+            out_checkpoints.clear();
             if (cursor.pos < text.size() && text[cursor.pos] == ']') {
                 ++cursor.pos;
             } else {
                 while (cursor.pos < text.size()) {
-                    ManifestEpoch epoch{};
-                    if (!parse_epoch(cursor, epoch, error)) {
+                    ManifestCheckpoint checkpoint{};
+                    if (!parse_checkpoint(cursor, checkpoint, error)) {
                         return false;
                     }
-                    out_epochs.push_back(epoch);
+                    out_checkpoints.push_back(checkpoint);
                     skip_ws(cursor);
                     if (cursor.pos < text.size() && text[cursor.pos] == ',') {
                         ++cursor.pos;
@@ -484,11 +484,11 @@ static bool parse_manifest_json(const std::string& text, std::vector<ManifestEpo
                     break;
                 }
                 if (!consume(cursor, ']')) {
-                    error = "expected closing ']' for epochs";
+                    error = "expected closing ']' for checkpoints";
                     return false;
                 }
             }
-            found_epochs = true;
+            found_checkpoints = true;
         } else {
             if (!skip_value(cursor)) {
                 error = "failed to skip top-level value";
@@ -505,8 +505,8 @@ static bool parse_manifest_json(const std::string& text, std::vector<ManifestEpo
             break;
         }
     }
-    if (!found_epochs) {
-        error = "manifest missing epochs";
+    if (!found_checkpoints) {
+        error = "manifest missing checkpoints";
         return false;
     }
     return true;
@@ -692,7 +692,7 @@ static bool apply_delta_payload(const std::vector<uint8_t>& payload, std::vector
     return true;
 }
 
-static bool find_region_chunk(const EpochRecord& record,
+static bool find_region_chunk(const CheckpointRecord& record,
     uint32_t region_id,
     const uint8_t* ring,
     uint32_t ring_bytes,
@@ -733,10 +733,10 @@ static bool find_region_chunk(const EpochRecord& record,
     return false;
 }
 
-static bool build_expected_region_bytes(uint32_t target_epoch,
+static bool build_expected_region_bytes(uint32_t target_checkpoint,
     uint32_t region_id,
     uint32_t region_size_bytes,
-    const std::vector<EpochRecord>& valid_records,
+    const std::vector<CheckpointRecord>& valid_records,
     const uint8_t* ring,
     uint32_t ring_bytes,
     cudaStream_t stream,
@@ -744,8 +744,8 @@ static bool build_expected_region_bytes(uint32_t target_epoch,
     std::string& error) {
     bool have_snapshot = false;
     out_expected.assign(region_size_bytes, 0u);
-    for (const EpochRecord& record : valid_records) {
-        if (record.epoch_id > target_epoch) {
+    for (const CheckpointRecord& record : valid_records) {
+        if (record.checkpoint_id > target_checkpoint) {
             break;
         }
         ChunkHeader header{};
@@ -776,7 +776,7 @@ static bool build_expected_region_bytes(uint32_t target_epoch,
         }
     }
     if (!have_snapshot) {
-        error = "no snapshot found before target epoch";
+        error = "no snapshot found before target checkpoint";
         return false;
     }
     return true;
@@ -805,7 +805,7 @@ __global__ void xor_byte_kernel(uint8_t* data, uint32_t size_bytes, uint32_t off
 }
 
 static void append_trace_event(TraceCollector* trace, const char* name, double ts_us,
-    uint32_t epoch_id, uint32_t region_id, uint32_t offset_bytes, bool include_args) {
+    uint32_t checkpoint_id, uint32_t region_id, uint32_t offset_bytes, bool include_args) {
     if (!trace) {
         return;
     }
@@ -817,7 +817,7 @@ static void append_trace_event(TraceCollector* trace, const char* name, double t
     event.pid = 1;
     event.tid = 0;
     if (include_args) {
-        event.args.push_back({"epoch_id", std::to_string(epoch_id), false});
+        event.args.push_back({"checkpoint_id", std::to_string(checkpoint_id), false});
         event.args.push_back({"region_id", std::to_string(region_id), false});
         event.args.push_back({"offset", std::to_string(offset_bytes), false});
     }
@@ -835,9 +835,9 @@ static void write_report_json(const VerifyReport& report, const char* path, bool
     out.imbue(std::locale::classic());
     out << "{";
     out << "\"status\":\"" << report.status << "\"";
-    out << ",\"tested_epoch_range\":{";
-    out << "\"begin\":" << report.tested_epoch_begin;
-    out << ",\"end\":" << report.tested_epoch_end;
+    out << ",\"tested_checkpoint_range\":{";
+    out << "\"begin\":" << report.tested_checkpoint_begin;
+    out << ",\"end\":" << report.tested_checkpoint_end;
     out << "}";
     out << ",\"tested_regions\":[";
     for (size_t i = 0; i < report.tested_regions.size(); ++i) {
@@ -853,7 +853,7 @@ static void write_report_json(const VerifyReport& report, const char* path, bool
     } else {
         const VerifyMismatch& mm = report.first_mismatch;
         out << "{";
-        out << "\"epoch_id\":" << mm.epoch_id;
+        out << "\"checkpoint_id\":" << mm.checkpoint_id;
         out << ",\"region_id\":" << mm.region_id;
         out << ",\"expected_hash64\":\"" << format_hash64(mm.expected_hash64) << "\"";
         out << ",\"actual_hash64\":\"" << format_hash64(mm.actual_hash64) << "\"";
@@ -879,7 +879,7 @@ static void write_report_json(const VerifyReport& report, const char* path, bool
             }
             const VerifyMismatch& mm = report.mismatches[i];
             out << "{";
-            out << "\"epoch_id\":" << mm.epoch_id;
+            out << "\"checkpoint_id\":" << mm.checkpoint_id;
             out << ",\"region_id\":" << mm.region_id;
             out << ",\"expected_hash64\":\"" << format_hash64(mm.expected_hash64) << "\"";
             out << ",\"actual_hash64\":\"" << format_hash64(mm.actual_hash64) << "\"";
@@ -944,72 +944,72 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
-    std::vector<ManifestEpoch> manifest_epochs;
+    std::vector<ManifestCheckpoint> manifest_checkpoints;
     std::string parse_error;
-    if (!parse_manifest_json(manifest_text, manifest_epochs, parse_error)) {
+    if (!parse_manifest_json(manifest_text, manifest_checkpoints, parse_error)) {
         report.error = parse_error.empty() ? "manifest parse failed" : parse_error;
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
-    if (manifest_epochs.empty()) {
-        report.error = "manifest contains no epochs";
+    if (manifest_checkpoints.empty()) {
+        report.error = "manifest contains no checkpoints";
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
 
-    std::vector<EpochRecord> host_epochs;
-    if (!read_epochs_to_host(host_epochs)) {
-        report.error = "failed to read epochs";
+    std::vector<CheckpointRecord> host_checkpoints;
+    if (!read_checkpoints_to_host(host_checkpoints)) {
+        report.error = "failed to read checkpoints";
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
-    std::vector<EpochRecord> valid_records;
-    valid_records.reserve(host_epochs.size());
-    uint32_t min_epoch = UINT32_MAX;
-    uint32_t max_epoch = 0u;
-    for (const EpochRecord& record : host_epochs) {
+    std::vector<CheckpointRecord> valid_records;
+    valid_records.reserve(host_checkpoints.size());
+    uint32_t min_checkpoint = UINT32_MAX;
+    uint32_t max_checkpoint = 0u;
+    for (const CheckpointRecord& record : host_checkpoints) {
         if (record.chunk_count == 0u || record.reserved0 == 0u) {
             continue;
         }
-        if (record.epoch_id < min_valid_epoch_) {
+        if (record.checkpoint_id < min_valid_checkpoint_) {
             continue;
         }
-        const uint32_t expected_generation = record.epoch_id / cfg_.epoch_capacity;
+        const uint32_t expected_generation = record.checkpoint_id / cfg_.checkpoint_capacity;
         if (record.reserved1 != expected_generation) {
             continue;
         }
         valid_records.push_back(record);
-        min_epoch = std::min(min_epoch, record.epoch_id);
-        max_epoch = std::max(max_epoch, record.epoch_id);
+        min_checkpoint = std::min(min_checkpoint, record.checkpoint_id);
+        max_checkpoint = std::max(max_checkpoint, record.checkpoint_id);
     }
     if (valid_records.empty()) {
-        report.error = "no valid epochs available in ring";
+        report.error = "no valid checkpoints available in ring";
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
     std::sort(valid_records.begin(), valid_records.end(),
-        [](const EpochRecord& a, const EpochRecord& b) { return a.epoch_id < b.epoch_id; });
+        [](const CheckpointRecord& a, const CheckpointRecord& b) { return a.checkpoint_id < b.checkpoint_id; });
 
-    std::vector<ManifestEpoch> filtered_epochs;
-    filtered_epochs.reserve(manifest_epochs.size());
-    for (const ManifestEpoch& epoch : manifest_epochs) {
-        if (options.epoch_range_set) {
-            if (epoch.epoch_id < options.epoch_begin || epoch.epoch_id > options.epoch_end) {
+    std::vector<ManifestCheckpoint> filtered_checkpoints;
+    filtered_checkpoints.reserve(manifest_checkpoints.size());
+    for (const ManifestCheckpoint& checkpoint : manifest_checkpoints) {
+        if (options.checkpoint_range_set) {
+            if (checkpoint.checkpoint_id < options.checkpoint_begin || checkpoint.checkpoint_id > options.checkpoint_end) {
                 continue;
             }
         }
-        filtered_epochs.push_back(epoch);
+        filtered_checkpoints.push_back(checkpoint);
     }
-    if (filtered_epochs.empty()) {
-        report.error = "no epochs matched the requested range";
+    if (filtered_checkpoints.empty()) {
+        report.error = "no checkpoints matched the requested range";
         write_report_json(report, options.report_path, options.continue_on_mismatch);
         return false;
     }
-    for (const ManifestEpoch& epoch : filtered_epochs) {
-        if (epoch.epoch_id < min_epoch || epoch.epoch_id > max_epoch) {
+    for (const ManifestCheckpoint& checkpoint : filtered_checkpoints) {
+        if (checkpoint.checkpoint_id < min_checkpoint || checkpoint.checkpoint_id > max_checkpoint) {
             std::ostringstream msg;
-            msg << "manifest epoch " << epoch.epoch_id << " not available; valid range "
-                << min_epoch << "-" << max_epoch;
+            msg << "manifest checkpoint " << checkpoint.checkpoint_id << " not available; valid range "
+                << min_checkpoint << "-" << max_checkpoint;
             report.error = msg.str();
             write_report_json(report, options.report_path, options.continue_on_mismatch);
             return false;
@@ -1019,8 +1019,8 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
     std::vector<uint32_t> region_filter = options.region_ids;
     if (region_filter.empty()) {
         std::vector<uint32_t> collected;
-        for (const ManifestEpoch& epoch : filtered_epochs) {
-            for (const ManifestRegion& region : epoch.regions) {
+        for (const ManifestCheckpoint& checkpoint : filtered_checkpoints) {
+            for (const ManifestRegion& region : checkpoint.regions) {
                 collected.push_back(region.region_id);
             }
         }
@@ -1041,8 +1041,8 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
         }
     }
 
-    report.tested_epoch_begin = filtered_epochs.front().epoch_id;
-    report.tested_epoch_end = filtered_epochs.back().epoch_id;
+    report.tested_checkpoint_begin = filtered_checkpoints.front().checkpoint_id;
+    report.tested_checkpoint_end = filtered_checkpoints.back().checkpoint_id;
     report.tested_regions = region_filter;
 
     cudaStream_t stream = options.stream;
@@ -1064,14 +1064,14 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
     }
 
     bool any_mismatch = false;
-    for (const ManifestEpoch& epoch : filtered_epochs) {
-        if (!rewind_to_epoch(epoch.epoch_id, stream)) {
-            report.error = "rewind_to_epoch failed";
+    for (const ManifestCheckpoint& checkpoint : filtered_checkpoints) {
+        if (!rewind_to_checkpoint(checkpoint.checkpoint_id, stream)) {
+            report.error = "rewind_to_checkpoint failed";
             cudaFree(d_hashes);
             write_report_json(report, options.report_path, options.continue_on_mismatch);
             return false;
         }
-        if (options.tamper.enabled && options.tamper.epoch_id == epoch.epoch_id) {
+        if (options.tamper.enabled && options.tamper.checkpoint_id == checkpoint.checkpoint_id) {
             const uint32_t region_id = options.tamper.region_id;
             if (region_id < cfg_.region_capacity) {
                 const TrackedRegion& region = host_regions_[region_id];
@@ -1099,10 +1099,10 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
         for (size_t i = 0; i < region_filter.size(); ++i) {
             const uint32_t region_id = region_filter[i];
             const uint64_t actual_hash = host_hashes[i];
-            auto manifest_it = std::find_if(epoch.regions.begin(), epoch.regions.end(),
+            auto manifest_it = std::find_if(checkpoint.regions.begin(), checkpoint.regions.end(),
                 [region_id](const ManifestRegion& region) { return region.region_id == region_id; });
-            if (manifest_it == epoch.regions.end()) {
-                report.error = "region missing in manifest epoch";
+            if (manifest_it == checkpoint.regions.end()) {
+                report.error = "region missing in manifest checkpoint";
                 cudaFree(d_hashes);
                 write_report_json(report, options.report_path, options.continue_on_mismatch);
                 return false;
@@ -1113,7 +1113,7 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
             }
             any_mismatch = true;
             VerifyMismatch mismatch{};
-            mismatch.epoch_id = epoch.epoch_id;
+            mismatch.checkpoint_id = checkpoint.checkpoint_id;
             mismatch.region_id = region_id;
             mismatch.expected_hash64 = expected_hash;
             mismatch.actual_hash64 = actual_hash;
@@ -1123,7 +1123,7 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
             const TrackedRegion& region = host_regions_[region_id];
             if (region.size_bytes == 0u || region.base_ptr == 0u) {
                 localize_error = "region not available for localization";
-            } else if (!build_expected_region_bytes(epoch.epoch_id,
+            } else if (!build_expected_region_bytes(checkpoint.checkpoint_id,
                 region_id,
                 region.size_bytes,
                 valid_records,
@@ -1226,7 +1226,7 @@ bool Recorder::verify_manifest_json(const char* manifest_path, const VerifyOptio
             if (options.trace_annotate) {
                 const auto now = std::chrono::steady_clock::now();
                 const double ts_us = std::chrono::duration<double, std::micro>(now - trace_start).count();
-                append_trace_event(options.trace, "verify_mismatch", ts_us, epoch.epoch_id, region_id,
+                append_trace_event(options.trace, "verify_mismatch", ts_us, checkpoint.checkpoint_id, region_id,
                     mismatch.localized ? mismatch.first_diff_offset_bytes : 0u, true);
             }
 

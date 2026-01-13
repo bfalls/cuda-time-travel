@@ -12,7 +12,7 @@
 
 namespace tt {
 
-struct DeviceEpochBegin;
+struct DeviceCheckpointBegin;
 class TraceCollector;
 
 enum class OverwriteMode : uint32_t {
@@ -33,16 +33,16 @@ enum class RecorderStatus : uint32_t {
     kInvalidChunkType,
     kInvalidPayload,
     kAlignmentError,
-    kEpochNotFound,
-    kEpochDropped,
+    kCheckpointNotFound,
+    kCheckpointDropped,
     kDeterminismViolation
 };
 
 struct RecorderConfig {
     uint32_t ring_bytes = 0;
-    uint32_t epoch_capacity = 0;
+    uint32_t checkpoint_capacity = 0;
     uint32_t region_capacity = 0;
-    uint32_t retention_epochs = 0;
+    uint32_t retention_checkpoints = 0;
     OverwriteMode overwrite_mode = OverwriteMode::kDropOldest;
     bool deterministic = false;
     bool enable_manifest = false;
@@ -64,8 +64,8 @@ struct ManifestRegion {
     bool snapshot = true;
 };
 
-struct ManifestEpoch {
-    uint32_t epoch_id = 0;
+struct ManifestCheckpoint {
+    uint32_t checkpoint_id = 0;
     uint32_t ring_bytes_written = 0;
     std::vector<ManifestRegion> regions{};
 };
@@ -82,7 +82,7 @@ struct CaptureDeps {
 };
 
 struct DepWaitRecord {
-    uint32_t epoch_id = 0;
+    uint32_t checkpoint_id = 0;
     uint32_t region_id = 0;
     uint64_t event_ptr = 0;
     uint64_t producer_stream = 0;
@@ -93,14 +93,14 @@ struct DepWaitRecord {
 
 struct VerifyTamper {
     bool enabled = false;
-    uint32_t epoch_id = 0;
+    uint32_t checkpoint_id = 0;
     uint32_t region_id = 0;
     uint32_t byte_offset = 0;
     uint8_t xor_mask = 0;
 };
 
 struct VerifyMismatch {
-    uint32_t epoch_id = 0;
+    uint32_t checkpoint_id = 0;
     uint32_t region_id = 0;
     uint64_t expected_hash64 = 0;
     uint64_t actual_hash64 = 0;
@@ -113,8 +113,8 @@ struct VerifyMismatch {
 
 struct VerifyReport {
     std::string status{};
-    uint32_t tested_epoch_begin = 0;
-    uint32_t tested_epoch_end = 0;
+    uint32_t tested_checkpoint_begin = 0;
+    uint32_t tested_checkpoint_end = 0;
     std::vector<uint32_t> tested_regions{};
     bool has_mismatch = false;
     VerifyMismatch first_mismatch{};
@@ -131,9 +131,9 @@ struct VerifyOptions {
     bool continue_on_mismatch = false;
     bool localize = false;
     bool trace_annotate = false;
-    bool epoch_range_set = false;
-    uint32_t epoch_begin = 0;
-    uint32_t epoch_end = 0;
+    bool checkpoint_range_set = false;
+    uint32_t checkpoint_begin = 0;
+    uint32_t checkpoint_end = 0;
     std::vector<uint32_t> region_ids{};
     const char* report_path = nullptr;
     cudaStream_t stream = nullptr;
@@ -149,13 +149,13 @@ public:
     bool register_region(uint32_t region_id, void* device_ptr, uint32_t size_bytes, uint32_t options = 1);
     bool set_region_full_snapshot_period(uint32_t region_id, uint32_t period);
 
-    bool capture_epoch(cudaStream_t stream);
-    bool capture_epoch(cudaStream_t stream, const CaptureDeps& deps);
-    bool rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream);
-    bool read_epochs_to_host(std::vector<EpochRecord>& out);
+    bool capture_checkpoint(cudaStream_t stream);
+    bool capture_checkpoint(cudaStream_t stream, const CaptureDeps& deps);
+    bool rewind_to_checkpoint(uint32_t target_checkpoint, cudaStream_t stream);
+    bool read_checkpoints_to_host(std::vector<CheckpointRecord>& out);
     bool write_manifest_json(const char* path) const;
     void clear_manifest();
-    const std::vector<ManifestEpoch>& manifest() const { return manifest_epochs_; }
+    const std::vector<ManifestCheckpoint>& manifest() const { return manifest_checkpoints_; }
     RecorderStatus last_status() const { return last_status_; }
     const RecorderGraphControl* graph_control_device() const { return d_graph_control_; }
     bool update_graph_control(const RecorderGraphControl& control, cudaStream_t stream);
@@ -171,7 +171,7 @@ private:
     RecorderConfig cfg_{};
     ControlBlock* d_control_ = nullptr;
     uint8_t* d_ring_ = nullptr;
-    EpochRecord* d_epochs_ = nullptr;
+    CheckpointRecord* d_checkpoints_ = nullptr;
     TrackedRegion* d_regions_ = nullptr;
     uint8_t* d_baseline_arena_ = nullptr;
     uint64_t* d_baseline_ptrs_ = nullptr;
@@ -180,7 +180,7 @@ private:
     uint32_t* d_first_ring_offset_ = nullptr;
     uint32_t* d_first_was_written_ = nullptr;
     uint32_t* d_delta_sizes_ = nullptr;
-    DeviceEpochBegin* d_epoch_begin_ = nullptr;
+    DeviceCheckpointBegin* d_checkpoint_begin_ = nullptr;
     uint32_t* d_stamp_base_ = nullptr;
     uint32_t* d_dep_stamp_base_ = nullptr;
     uint64_t* d_region_hashes_ = nullptr;
@@ -189,7 +189,7 @@ private:
     uint32_t* d_enabled_count_ = nullptr;
     RecorderGraphControl graph_control_host_{};
     std::vector<TrackedRegion> host_regions_{};
-    std::vector<ManifestEpoch> manifest_epochs_{};
+    std::vector<ManifestCheckpoint> manifest_checkpoints_{};
     bool enable_deltas_ = true;
     bool enable_graph_stamps_ = false;
     bool deterministic_ = false;
@@ -202,7 +202,7 @@ private:
     uint32_t* d_dep_stamp_counter_ = nullptr;
     uint32_t dep_stamp_capacity_ = 0;
     bool initialized_ = false;
-    uint32_t min_valid_epoch_ = 0;
+    uint32_t min_valid_checkpoint_ = 0;
     RecorderStatus last_status_ = RecorderStatus::kOk;
     std::vector<DepWaitRecord> dep_wait_records_{};
 };

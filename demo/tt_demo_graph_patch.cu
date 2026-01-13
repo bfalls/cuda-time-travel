@@ -24,26 +24,26 @@ bool check_cuda(cudaError_t err, const char* label) {
 __global__ void write_pattern_iter_kernel(uint32_t* data, uint32_t count, const tt::IterParams* params) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count && params) {
-        const uint32_t epoch = params->epoch;
+        const uint32_t checkpoint = params->checkpoint;
         const uint32_t seed = params->seed;
         const uint32_t mix = (idx * 2654435761u) ^ seed;
-        const uint32_t value = epoch ^ mix;
+        const uint32_t value = checkpoint ^ mix;
         data[idx] = (params->flags & 1u) ? ~value : value;
     }
 }
 
-__global__ void write_pattern_patch_kernel(uint32_t* data, uint32_t count, uint32_t epoch, uint32_t seed) {
+__global__ void write_pattern_patch_kernel(uint32_t* data, uint32_t count, uint32_t checkpoint, uint32_t seed) {
     const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < count) {
         const uint32_t mix = (idx * 2654435761u) ^ seed;
-        data[idx] = epoch ^ mix;
+        data[idx] = checkpoint ^ mix;
     }
 }
 
-bool verify_pattern(const std::vector<uint32_t>& data, uint32_t epoch, uint32_t seed, uint32_t flags) {
+bool verify_pattern(const std::vector<uint32_t>& data, uint32_t checkpoint, uint32_t seed, uint32_t flags) {
     for (size_t i = 0; i < data.size(); ++i) {
         const uint32_t mix = (static_cast<uint32_t>(i) * 2654435761u) ^ seed;
-        const uint32_t expected = epoch ^ mix;
+        const uint32_t expected = checkpoint ^ mix;
         const uint32_t value = (flags & 1u) ? ~expected : expected;
         if (data[i] != value) {
             return false;
@@ -64,7 +64,7 @@ struct PatchNode {
     uint32_t node_id = 0;
     cudaKernelNodeParams params{};
     uint32_t* buffer_ptr = nullptr;
-    uint32_t epoch_value = 0;
+    uint32_t checkpoint_value = 0;
     uint32_t seed_value = 0;
 };
 
@@ -90,7 +90,7 @@ bool build_graph(tt::GraphSession& graph,
         write_pattern_iter_kernel<<<blocks, threads, 0, stream>>>(d_buffer_a, element_count, d_iter_params);
         write_pattern_iter_kernel<<<blocks, threads, 0, stream>>>(d_buffer_b, element_count, d_iter_params);
     }
-    if (!recorder.capture_epoch(stream)) {
+    if (!recorder.capture_checkpoint(stream)) {
         graph.destroy();
         return false;
     }
@@ -125,7 +125,7 @@ bool build_graph(tt::GraphSession& graph,
 
 bool apply_patch_updates(tt::GraphSession& graph,
     std::vector<PatchNode>& patch_nodes,
-    uint32_t epoch,
+    uint32_t checkpoint,
     uint32_t seed,
     bool allow_fallback,
     bool& did_fallback,
@@ -142,10 +142,10 @@ bool apply_patch_updates(tt::GraphSession& graph,
     tt::GraphUpdateStatus status{};
     bool printed = false;
     for (auto& patch : patch_nodes) {
-        patch.epoch_value = epoch;
+        patch.checkpoint_value = checkpoint;
         patch.seed_value = seed;
         uint32_t* buffer_ptr = patch.buffer_ptr ? patch.buffer_ptr : d_buffer_a;
-        void* kernel_args[] = {&buffer_ptr, &element_count, &patch.epoch_value, &patch.seed_value};
+        void* kernel_args[] = {&buffer_ptr, &element_count, &patch.checkpoint_value, &patch.seed_value};
         patch.params.kernelParams = kernel_args;
         if (!graph.update_kernel_node_params(patch.node_id, patch.params, &status)) {
             std::printf("kernel patch failed: %s (%s)\n",
@@ -169,7 +169,7 @@ bool apply_patch_updates(tt::GraphSession& graph,
                 patch_nodes = rebuilt;
                 return apply_patch_updates(graph,
                     patch_nodes,
-                    epoch,
+                    checkpoint,
                     seed,
                     false,
                     did_fallback,
@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
 
     const uint32_t element_count = 1024;
     const uint32_t size_bytes = element_count * sizeof(uint32_t);
-    const uint32_t stamps_per_epoch = 3;
+    const uint32_t stamps_per_checkpoint = 3;
 
     uint32_t* d_buffer_a = nullptr;
     uint32_t* d_buffer_b = nullptr;
@@ -226,7 +226,7 @@ int main(int argc, char** argv) {
     if (!check_cuda(cudaMalloc(&d_buffer_a, size_bytes), "cudaMalloc buffer A") ||
         !check_cuda(cudaMalloc(&d_buffer_b, size_bytes), "cudaMalloc buffer B") ||
         !check_cuda(cudaMalloc(&d_iter_params, sizeof(tt::IterParams)), "cudaMalloc iter params") ||
-        !check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * iterations * stamps_per_epoch), "cudaMalloc stamps") ||
+        !check_cuda(cudaMalloc(&d_stamps, sizeof(uint64_t) * iterations * stamps_per_checkpoint), "cudaMalloc stamps") ||
         !check_cuda(cudaMalloc(&d_stamp_counter, sizeof(uint32_t)), "cudaMalloc stamp counter")) {
         return 1;
     }
@@ -245,9 +245,9 @@ int main(int argc, char** argv) {
     tt::Recorder recorder;
     tt::RecorderConfig cfg{};
     cfg.ring_bytes = ring_bytes;
-    cfg.epoch_capacity = 32;
+    cfg.checkpoint_capacity = 32;
     cfg.region_capacity = 4;
-    cfg.retention_epochs = 0;
+    cfg.retention_checkpoints = 0;
     cfg.overwrite_mode = tt::OverwriteMode::kDropOldest;
     cfg.enable_graph_stamps = true;
     cfg.graph_stamps = d_stamps;
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
         }
 
         tt::IterParams host_params{};
-        host_params.epoch = iter;
+        host_params.checkpoint = iter;
         host_params.seed = 0x1234u + iter;
         host_params.flags = use_kernel_patch ? 0u : (iter & 1u);
         if (!use_kernel_patch) {
@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
 
         if (!apply_patch_updates(graph,
                 patch_nodes,
-                host_params.epoch,
+                host_params.checkpoint,
                 host_params.seed,
                 true,
                 did_fallback,
@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
         event.dur_us = 0.0;
         event.pid = 1;
         event.tid = 0;
-        event.args.push_back({"epoch_id", std::to_string(iter), false});
+        event.args.push_back({"checkpoint_id", std::to_string(iter), false});
         trace.add_event(event);
     }
 
@@ -381,9 +381,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    const uint32_t target_epoch = iterations > 0 ? (iterations - 1u) : 0u;
-    if (!recorder.rewind_to_epoch(target_epoch, stream)) {
-        std::printf("rewind_to_epoch failed\n");
+    const uint32_t target_checkpoint = iterations > 0 ? (iterations - 1u) : 0u;
+    if (!recorder.rewind_to_checkpoint(target_checkpoint, stream)) {
+        std::printf("rewind_to_checkpoint failed\n");
         graph.destroy();
         recorder.shutdown();
         return 1;
@@ -396,10 +396,10 @@ int main(int argc, char** argv) {
     }
 
     tt::IterParams final_params{};
-    final_params.epoch = target_epoch;
-    final_params.seed = 0x1234u + target_epoch;
-    final_params.flags = use_kernel_patch ? 0u : (target_epoch & 1u);
-    if (!verify_pattern(host_out, final_params.epoch, final_params.seed, final_params.flags)) {
+    final_params.checkpoint = target_checkpoint;
+    final_params.seed = 0x1234u + target_checkpoint;
+    final_params.flags = use_kernel_patch ? 0u : (target_checkpoint & 1u);
+    if (!verify_pattern(host_out, final_params.checkpoint, final_params.seed, final_params.flags)) {
         std::printf("tt_demo_graph_patch verification failed\n");
         graph.destroy();
         recorder.shutdown();

@@ -15,15 +15,15 @@ static constexpr uint32_t kChunkFlagWrapMarker = 1u << 0;
 
 struct alignas(64) ControlBlock {
     uint64_t write_pos;
-    uint32_t epoch_id;
-    uint32_t epoch_index_pos;
+    uint32_t checkpoint_id;
+    uint32_t checkpoint_index_pos;
     uint32_t ring_bytes;
-    uint32_t epoch_capacity;
+    uint32_t checkpoint_capacity;
     uint32_t region_capacity;
     uint32_t flags;
-    uint32_t min_valid_epoch;
+    uint32_t min_valid_checkpoint;
     uint32_t overwrite_mode;
-    uint32_t retention_epochs;
+    uint32_t retention_checkpoints;
     uint32_t reserved0;
     uint8_t padding[16];
 };
@@ -37,8 +37,8 @@ struct alignas(32) TrackedRegion {
     uint64_t user_tag;
 };
 
-struct alignas(32) EpochRecord {
-    uint32_t epoch_id;
+struct alignas(32) CheckpointRecord {
+    uint32_t checkpoint_id;
     uint32_t chunk_count;
     uint32_t region_count;
     uint32_t reserved0;
@@ -51,7 +51,7 @@ struct alignas(16) ChunkHeader {
     uint32_t magic;
     uint16_t version;
     uint16_t header_bytes;
-    uint32_t epoch_id;
+    uint32_t checkpoint_id;
     uint32_t region_id;
     uint32_t chunk_type;
     uint32_t payload_bytes;
@@ -65,8 +65,8 @@ static_assert(alignof(ControlBlock) == 64, "ControlBlock must be 64-byte aligned
 static_assert(sizeof(TrackedRegion) == 32, "TrackedRegion must be 32 bytes");
 static_assert(alignof(TrackedRegion) == 32, "TrackedRegion must be 32-byte aligned");
 
-static_assert(sizeof(EpochRecord) == 32, "EpochRecord must be 32 bytes");
-static_assert(alignof(EpochRecord) == 32, "EpochRecord must be 32-byte aligned");
+static_assert(sizeof(CheckpointRecord) == 32, "CheckpointRecord must be 32 bytes");
+static_assert(alignof(CheckpointRecord) == 32, "CheckpointRecord must be 32-byte aligned");
 
 static_assert(sizeof(ChunkHeader) == 32, "ChunkHeader must be 32 bytes");
 static_assert(alignof(ChunkHeader) == 16, "ChunkHeader must be 16-byte aligned");

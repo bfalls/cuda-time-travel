@@ -14,19 +14,19 @@
 
 namespace tt {
 
-struct DeviceEpochBegin {
-    uint32_t epoch_id;
-    uint32_t epoch_index_pos;
+struct DeviceCheckpointBegin {
+    uint32_t checkpoint_id;
+    uint32_t checkpoint_index_pos;
     uint64_t write_pos_before;
 };
 
 namespace {
 
 static constexpr uint32_t kRingAlignment = 32u;
-static constexpr uint32_t kStampsPerEpoch = 3u;
-static constexpr uint32_t kStampEpochStart = 0u;
+static constexpr uint32_t kStampsPerCheckpoint = 3u;
+static constexpr uint32_t kStampCheckpointStart = 0u;
 static constexpr uint32_t kStampAfterRegions = 1u;
-static constexpr uint32_t kStampEpochEnd = 2u;
+static constexpr uint32_t kStampCheckpointEnd = 2u;
 static constexpr uint32_t kHashThreads = 256u;
 static constexpr uint64_t kHashOffset = 14695981039346656037ull;
 static constexpr uint64_t kHashPrime = 1099511628211ull;
@@ -58,11 +58,11 @@ __device__ inline bool graph_control_region_enabled(const RecorderGraphControl* 
     return (control->region_mask & mask) != 0ull;
 }
 
-__device__ inline bool graph_control_snapshot_allowed(const RecorderGraphControl* control, uint32_t epoch_id) {
+__device__ inline bool graph_control_snapshot_allowed(const RecorderGraphControl* control, uint32_t checkpoint_id) {
     if (!control || control->snapshot_period == 0u) {
         return true;
     }
-    return (epoch_id % control->snapshot_period) == 0u;
+    return (checkpoint_id % control->snapshot_period) == 0u;
 }
 
 __host__ __device__ inline uint32_t align_up(uint32_t value) {
@@ -178,7 +178,7 @@ __device__ inline void reserve_and_get_ring_offset(ControlBlock* control,
             marker->magic = kChunkMagic;
             marker->version = kChunkVersion;
             marker->header_bytes = kChunkHeaderBytes;
-            marker->epoch_id = 0;
+            marker->checkpoint_id = 0;
             marker->region_id = 0;
             marker->chunk_type = kChunkTypeWrapMarker;
             marker->payload_bytes = 0;
@@ -209,13 +209,13 @@ __device__ inline void reserve_and_get_ring_offset(ControlBlock* control,
     }
 }
 
-__global__ void begin_epoch_kernel(ControlBlock* control, DeviceEpochBegin* out) {
+__global__ void begin_checkpoint_kernel(ControlBlock* control, DeviceCheckpointBegin* out) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         out->write_pos_before = control->write_pos;
-        uint32_t epoch_id = atomicAdd(&control->epoch_id, 1u);
-        uint32_t epoch_index_pos = atomicAdd(&control->epoch_index_pos, 1u);
-        out->epoch_id = epoch_id;
-        out->epoch_index_pos = (control->epoch_capacity > 0) ? (epoch_index_pos % control->epoch_capacity) : 0u;
+        uint32_t checkpoint_id = atomicAdd(&control->checkpoint_id, 1u);
+        uint32_t checkpoint_index_pos = atomicAdd(&control->checkpoint_index_pos, 1u);
+        out->checkpoint_id = checkpoint_id;
+        out->checkpoint_index_pos = (control->checkpoint_capacity > 0) ? (checkpoint_index_pos % control->checkpoint_capacity) : 0u;
     }
 }
 
@@ -224,7 +224,7 @@ __global__ void snapshot_region_kernel(ControlBlock* control,
     const uint64_t* baseline_ptrs,
     uint8_t* ring,
     uint32_t ring_bytes,
-    uint32_t epoch_id,
+    uint32_t checkpoint_id,
     uint32_t* first_ring_offset,
     uint32_t* first_was_written) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -247,7 +247,7 @@ __global__ void snapshot_region_kernel(ControlBlock* control,
         header->magic = kChunkMagic;
         header->version = kChunkVersion;
         header->header_bytes = kChunkHeaderBytes;
-        header->epoch_id = epoch_id;
+        header->checkpoint_id = checkpoint_id;
         header->region_id = region->region_id;
         header->chunk_type = kChunkTypeSnapshot;
         header->payload_bytes = payload_bytes;
@@ -281,7 +281,7 @@ __global__ void snapshot_region_graph_kernel(ControlBlock* control,
     const uint64_t* baseline_ptrs,
     uint8_t* ring,
     uint32_t ring_bytes,
-    const DeviceEpochBegin* begin,
+    const DeviceCheckpointBegin* begin,
     const RecorderGraphControl* graph_control,
     uint32_t* first_ring_offset,
     uint32_t* first_was_written,
@@ -293,7 +293,7 @@ __global__ void snapshot_region_graph_kernel(ControlBlock* control,
         if ((region->options & 1u) == 0u || region->size_bytes == 0) {
             return;
         }
-        if (!graph_control_snapshot_allowed(graph_control, begin->epoch_id)) {
+        if (!graph_control_snapshot_allowed(graph_control, begin->checkpoint_id)) {
             return;
         }
         if (!graph_control_region_enabled(graph_control, region->region_id)) {
@@ -315,7 +315,7 @@ __global__ void snapshot_region_graph_kernel(ControlBlock* control,
         header->magic = kChunkMagic;
         header->version = kChunkVersion;
         header->header_bytes = kChunkHeaderBytes;
-        header->epoch_id = begin->epoch_id;
+        header->checkpoint_id = begin->checkpoint_id;
         header->region_id = region->region_id;
         header->chunk_type = kChunkTypeSnapshot;
         header->payload_bytes = payload_bytes;
@@ -431,7 +431,7 @@ __global__ void delta_write_kernel(ControlBlock* control,
     const uint64_t* scratch_ptrs,
     uint8_t* ring,
     uint32_t ring_bytes,
-    uint32_t epoch_id,
+    uint32_t checkpoint_id,
     uint32_t payload_bytes,
     uint32_t* first_ring_offset,
     uint32_t* first_was_written) {
@@ -465,7 +465,7 @@ __global__ void delta_write_kernel(ControlBlock* control,
         header->magic = kChunkMagic;
         header->version = kChunkVersion;
         header->header_bytes = kChunkHeaderBytes;
-        header->epoch_id = epoch_id;
+        header->checkpoint_id = checkpoint_id;
         header->region_id = region->region_id;
         header->chunk_type = kChunkTypeDeltaXorRle0;
         header->payload_bytes = payload_bytes;
@@ -492,14 +492,14 @@ __global__ void delta_write_kernel(ControlBlock* control,
     }
 }
 
-__global__ void finalize_epoch_kernel(ControlBlock* control,
-    const DeviceEpochBegin* begin,
-    EpochRecord* epochs,
-    uint32_t epoch_capacity,
+__global__ void finalize_checkpoint_kernel(ControlBlock* control,
+    const DeviceCheckpointBegin* begin,
+    CheckpointRecord* checkpoints,
+    uint32_t checkpoint_capacity,
     const uint32_t* enabled_count,
     const uint32_t* first_ring_offset) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        if (!begin || !epochs || epoch_capacity == 0u) {
+        if (!begin || !checkpoints || checkpoint_capacity == 0u) {
             return;
         }
 
@@ -507,17 +507,17 @@ __global__ void finalize_epoch_kernel(ControlBlock* control,
         if (enabled_count) {
             enabled = *enabled_count;
         }
-        uint64_t epoch_bytes = control->write_pos - begin->write_pos_before;
-        EpochRecord record{};
-        record.epoch_id = begin->epoch_id;
+        uint64_t checkpoint_bytes = control->write_pos - begin->write_pos_before;
+        CheckpointRecord record{};
+        record.checkpoint_id = begin->checkpoint_id;
         record.chunk_count = enabled;
         record.region_count = enabled;
-        record.reserved0 = (epoch_bytes > UINT32_MAX) ? 0u : static_cast<uint32_t>(epoch_bytes);
+        record.reserved0 = (checkpoint_bytes > UINT32_MAX) ? 0u : static_cast<uint32_t>(checkpoint_bytes);
         record.ring_offset = (enabled > 0u && first_ring_offset) ? *first_ring_offset : 0u;
-        record.reserved1 = begin->epoch_id / epoch_capacity;
+        record.reserved1 = begin->checkpoint_id / checkpoint_capacity;
         record.timestamp = 0;
-        const uint32_t index = begin->epoch_index_pos % epoch_capacity;
-        epochs[index] = record;
+        const uint32_t index = begin->checkpoint_index_pos % checkpoint_capacity;
+        checkpoints[index] = record;
     }
 }
 
@@ -706,7 +706,7 @@ RecorderStatus read_chunk_header(const uint8_t* ring,
     return RecorderStatus::kOk;
 }
 
-RecorderStatus rewind_apply_epoch(const EpochRecord& record,
+RecorderStatus rewind_apply_checkpoint(const CheckpointRecord& record,
     TrackedRegion* d_regions,
     uint32_t region_capacity,
     const uint64_t* baseline_ptrs,
@@ -763,9 +763,9 @@ RecorderStatus rewind_apply_epoch(const EpochRecord& record,
 
 struct GraphKernelTagRegistrar {
     GraphKernelTagRegistrar() {
-        RegisterGraphKernelTag(reinterpret_cast<const void*>(begin_epoch_kernel), "tt.begin_epoch");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(begin_checkpoint_kernel), "tt.begin_checkpoint");
         RegisterGraphKernelTag(reinterpret_cast<const void*>(snapshot_region_graph_kernel), "tt.snapshot_region_graph");
-        RegisterGraphKernelTag(reinterpret_cast<const void*>(finalize_epoch_kernel), "tt.finalize_epoch");
+        RegisterGraphKernelTag(reinterpret_cast<const void*>(finalize_checkpoint_kernel), "tt.finalize_checkpoint");
         RegisterGraphKernelTag(reinterpret_cast<const void*>(stamp_controlled_kernel), "tt.graph_stamp");
         RegisterGraphKernelTag(reinterpret_cast<const void*>(reserve_stamp_range_controlled_kernel), "tt.graph_stamp_reserve");
     }
@@ -781,7 +781,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
     }
 
     last_status_ = RecorderStatus::kOk;
-    if (cfg.ring_bytes == 0 || cfg.epoch_capacity == 0 || cfg.region_capacity == 0) {
+    if (cfg.ring_bytes == 0 || cfg.checkpoint_capacity == 0 || cfg.region_capacity == 0) {
         last_status_ = RecorderStatus::kInvalidConfig;
         return false;
     }
@@ -789,7 +789,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
         last_status_ = RecorderStatus::kInvalidConfig;
         return false;
     }
-    if (cfg.retention_epochs > 0 && cfg.retention_epochs > cfg.epoch_capacity) {
+    if (cfg.retention_checkpoints > 0 && cfg.retention_checkpoints > cfg.checkpoint_capacity) {
         last_status_ = RecorderStatus::kInvalidConfig;
         return false;
     }
@@ -813,7 +813,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
     enable_manifest_ = cfg.enable_manifest;
     deterministic_stream_ = nullptr;
     deterministic_stream_set_ = false;
-    manifest_epochs_.clear();
+    manifest_checkpoints_.clear();
     dep_wait_records_.clear();
 
     cudaError_t err = cudaSuccess;
@@ -827,7 +827,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
-    err = cudaMalloc(reinterpret_cast<void**>(&d_epochs_), sizeof(EpochRecord) * cfg_.epoch_capacity);
+    err = cudaMalloc(reinterpret_cast<void**>(&d_checkpoints_), sizeof(CheckpointRecord) * cfg_.checkpoint_capacity);
     if (err != cudaSuccess) {
         shutdown();
         return false;
@@ -862,7 +862,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
-    err = cudaMalloc(reinterpret_cast<void**>(&d_epoch_begin_), sizeof(DeviceEpochBegin));
+    err = cudaMalloc(reinterpret_cast<void**>(&d_checkpoint_begin_), sizeof(DeviceCheckpointBegin));
     if (err != cudaSuccess) {
         shutdown();
         return false;
@@ -910,12 +910,12 @@ bool Recorder::init(const RecorderConfig& cfg) {
     ControlBlock host_control{};
     std::memset(&host_control, 0, sizeof(host_control));
     host_control.ring_bytes = cfg_.ring_bytes;
-    host_control.epoch_capacity = cfg_.epoch_capacity;
+    host_control.checkpoint_capacity = cfg_.checkpoint_capacity;
     host_control.region_capacity = cfg_.region_capacity;
-    host_control.min_valid_epoch = 0u;
+    host_control.min_valid_checkpoint = 0u;
     const OverwriteMode effective_overwrite = deterministic_ ? OverwriteMode::kBackpressure : cfg_.overwrite_mode;
     host_control.overwrite_mode = static_cast<uint32_t>(effective_overwrite);
-    host_control.retention_epochs = cfg_.retention_epochs;
+    host_control.retention_checkpoints = cfg_.retention_checkpoints;
 
     err = cudaMemcpy(d_control_, &host_control, sizeof(ControlBlock), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
@@ -928,7 +928,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
-    err = cudaMemset(d_epochs_, 0, sizeof(EpochRecord) * cfg_.epoch_capacity);
+    err = cudaMemset(d_checkpoints_, 0, sizeof(CheckpointRecord) * cfg_.checkpoint_capacity);
     if (err != cudaSuccess) {
         shutdown();
         return false;
@@ -963,7 +963,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
         shutdown();
         return false;
     }
-    err = cudaMemset(d_epoch_begin_, 0, sizeof(DeviceEpochBegin));
+    err = cudaMemset(d_checkpoint_begin_, 0, sizeof(DeviceCheckpointBegin));
     if (err != cudaSuccess) {
         shutdown();
         return false;
@@ -1030,7 +1030,7 @@ bool Recorder::init(const RecorderConfig& cfg) {
 
     host_regions_.assign(cfg_.region_capacity, TrackedRegion{});
     initialized_ = true;
-    min_valid_epoch_ = 0u;
+    min_valid_checkpoint_ = 0u;
     return true;
 }
 
@@ -1069,9 +1069,9 @@ void Recorder::shutdown() {
         cudaFree(d_delta_sizes_);
         d_delta_sizes_ = nullptr;
     }
-    if (d_epoch_begin_) {
-        cudaFree(d_epoch_begin_);
-        d_epoch_begin_ = nullptr;
+    if (d_checkpoint_begin_) {
+        cudaFree(d_checkpoint_begin_);
+        d_checkpoint_begin_ = nullptr;
     }
     if (d_stamp_base_) {
         cudaFree(d_stamp_base_);
@@ -1101,9 +1101,9 @@ void Recorder::shutdown() {
         cudaFree(d_regions_);
         d_regions_ = nullptr;
     }
-    if (d_epochs_) {
-        cudaFree(d_epochs_);
-        d_epochs_ = nullptr;
+    if (d_checkpoints_) {
+        cudaFree(d_checkpoints_);
+        d_checkpoints_ = nullptr;
     }
     if (d_ring_) {
         cudaFree(d_ring_);
@@ -1116,8 +1116,8 @@ void Recorder::shutdown() {
     initialized_ = false;
     cfg_ = RecorderConfig{};
     host_regions_.clear();
-    manifest_epochs_.clear();
-    min_valid_epoch_ = 0u;
+    manifest_checkpoints_.clear();
+    min_valid_checkpoint_ = 0u;
     last_status_ = RecorderStatus::kOk;
     enable_graph_stamps_ = false;
     deterministic_ = false;
@@ -1394,12 +1394,12 @@ bool Recorder::copy_region_hashes_to_host(cudaStream_t stream, const uint64_t* d
     return true;
 }
 
-bool Recorder::capture_epoch(cudaStream_t stream) {
+bool Recorder::capture_checkpoint(cudaStream_t stream) {
     CaptureDeps deps{};
-    return capture_epoch(stream, deps);
+    return capture_checkpoint(stream, deps);
 }
 
-bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
+bool Recorder::capture_checkpoint(cudaStream_t stream, const CaptureDeps& deps) {
     last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
         last_status_ = RecorderStatus::kNotInitialized;
@@ -1477,7 +1477,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             return false;
         }
 
-        begin_epoch_kernel<<<1, 1, 0, stream>>>(d_control_, d_epoch_begin_);
+        begin_checkpoint_kernel<<<1, 1, 0, stream>>>(d_control_, d_checkpoint_begin_);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
@@ -1496,7 +1496,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_graph_control_,
                 d_graph_stamp_counter_,
                 d_stamp_base_,
-                kStampsPerEpoch);
+                kStampsPerCheckpoint);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1506,7 +1506,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_graph_control_,
                 d_graph_stamps_,
                 d_stamp_base_,
-                kStampEpochStart);
+                kStampCheckpointStart);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1554,7 +1554,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_baseline_ptrs_,
                 d_ring_,
                 cfg_.ring_bytes,
-                d_epoch_begin_,
+                d_checkpoint_begin_,
                 d_graph_control_,
                 d_first_ring_offset_,
                 d_first_was_written_,
@@ -1578,11 +1578,11 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             }
         }
 
-        finalize_epoch_kernel<<<1, 1, 0, stream>>>(
+        finalize_checkpoint_kernel<<<1, 1, 0, stream>>>(
             d_control_,
-            d_epoch_begin_,
-            d_epochs_,
-            cfg_.epoch_capacity,
+            d_checkpoint_begin_,
+            d_checkpoints_,
+            cfg_.checkpoint_capacity,
             d_enabled_count_,
             d_first_ring_offset_);
         err = cudaGetLastError();
@@ -1595,7 +1595,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_graph_control_,
                 d_graph_stamps_,
                 d_stamp_base_,
-                kStampEpochEnd);
+                kStampCheckpointEnd);
             err = cudaGetLastError();
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
@@ -1613,7 +1613,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         return false;
     }
 
-    begin_epoch_kernel<<<1, 1, 0, stream>>>(d_control_, d_epoch_begin_);
+    begin_checkpoint_kernel<<<1, 1, 0, stream>>>(d_control_, d_checkpoint_begin_);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
@@ -1630,13 +1630,13 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         }
     }
     if (enable_graph_stamps_) {
-        reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_graph_stamp_counter_, d_stamp_base_, kStampsPerEpoch);
+        reserve_stamp_range_kernel<<<1, 1, 0, stream>>>(d_graph_stamp_counter_, d_stamp_base_, kStampsPerCheckpoint);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
             return false;
         }
-        stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampEpochStart);
+        stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampCheckpointStart);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
@@ -1644,8 +1644,8 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         }
     }
 
-    DeviceEpochBegin host_begin{};
-    err = cudaMemcpyAsync(&host_begin, d_epoch_begin_, sizeof(DeviceEpochBegin), cudaMemcpyDeviceToHost, stream);
+    DeviceCheckpointBegin host_begin{};
+    err = cudaMemcpyAsync(&host_begin, d_checkpoint_begin_, sizeof(DeviceCheckpointBegin), cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
         return false;
@@ -1700,7 +1700,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 should_snapshot = true;
             }
             if (!should_snapshot && region.full_snapshot_period > 0u) {
-                should_snapshot = ((host_begin.epoch_id % region.full_snapshot_period) == 0u);
+                should_snapshot = ((host_begin.checkpoint_id % region.full_snapshot_period) == 0u);
             }
             if (should_snapshot) {
                 continue;
@@ -1757,7 +1757,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             should_snapshot = true;
         }
         if (!should_snapshot && region.full_snapshot_period > 0u) {
-            should_snapshot = ((host_begin.epoch_id % region.full_snapshot_period) == 0u);
+            should_snapshot = ((host_begin.checkpoint_id % region.full_snapshot_period) == 0u);
         }
 
         uint32_t payload_bytes = 0;
@@ -1782,41 +1782,41 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         pending.push_back({i, chunk_type, payload_bytes, total_bytes});
     }
 
-    uint32_t min_valid_epoch = min_valid_epoch_;
-    if (cfg_.retention_epochs > 0 && host_begin.epoch_id + 1u > cfg_.retention_epochs) {
-        uint32_t retention_min = host_begin.epoch_id - cfg_.retention_epochs + 1u;
-        if (retention_min > min_valid_epoch) {
-            min_valid_epoch = retention_min;
+    uint32_t min_valid_checkpoint = min_valid_checkpoint_;
+    if (cfg_.retention_checkpoints > 0 && host_begin.checkpoint_id + 1u > cfg_.retention_checkpoints) {
+        uint32_t retention_min = host_begin.checkpoint_id - cfg_.retention_checkpoints + 1u;
+        if (retention_min > min_valid_checkpoint) {
+            min_valid_checkpoint = retention_min;
         }
     }
 
-    std::vector<EpochRecord> host_epochs;
-    host_epochs.resize(cfg_.epoch_capacity);
-    err = cudaMemcpy(host_epochs.data(),
-        d_epochs_,
-        sizeof(EpochRecord) * cfg_.epoch_capacity,
+    std::vector<CheckpointRecord> host_checkpoints;
+    host_checkpoints.resize(cfg_.checkpoint_capacity);
+    err = cudaMemcpy(host_checkpoints.data(),
+        d_checkpoints_,
+        sizeof(CheckpointRecord) * cfg_.checkpoint_capacity,
         cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
         return false;
     }
 
-    struct EpochEntry {
+    struct CheckpointEntry {
         uint32_t index;
-        uint32_t epoch_id;
+        uint32_t checkpoint_id;
         uint32_t bytes;
     };
-    std::vector<EpochEntry> valid_epochs;
-    valid_epochs.reserve(cfg_.epoch_capacity);
+    std::vector<CheckpointEntry> valid_checkpoints;
+    valid_checkpoints.reserve(cfg_.checkpoint_capacity);
     std::vector<uint32_t> clear_indices;
 
     uint64_t used_bytes = 0;
-    for (uint32_t i = 0; i < cfg_.epoch_capacity; ++i) {
-        const EpochRecord& record = host_epochs[i];
+    for (uint32_t i = 0; i < cfg_.checkpoint_capacity; ++i) {
+        const CheckpointRecord& record = host_checkpoints[i];
         if (record.chunk_count == 0u) {
             continue;
         }
-        if (record.epoch_id < min_valid_epoch) {
+        if (record.checkpoint_id < min_valid_checkpoint) {
             clear_indices.push_back(i);
             continue;
         }
@@ -1824,46 +1824,46 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             clear_indices.push_back(i);
             continue;
         }
-        uint32_t expected_generation = record.epoch_id / cfg_.epoch_capacity;
+        uint32_t expected_generation = record.checkpoint_id / cfg_.checkpoint_capacity;
         if (record.reserved1 != expected_generation) {
             clear_indices.push_back(i);
             continue;
         }
 
         used_bytes += record.reserved0;
-        valid_epochs.push_back({i, record.epoch_id, record.reserved0});
+        valid_checkpoints.push_back({i, record.checkpoint_id, record.reserved0});
     }
 
-    auto drop_oldest = [&](uint32_t* io_min_valid_epoch) {
-        if (valid_epochs.empty()) {
+    auto drop_oldest = [&](uint32_t* io_min_valid_checkpoint) {
+        if (valid_checkpoints.empty()) {
             return false;
         }
         size_t oldest_index = 0;
-        for (size_t idx = 1; idx < valid_epochs.size(); ++idx) {
-            if (valid_epochs[idx].epoch_id < valid_epochs[oldest_index].epoch_id) {
+        for (size_t idx = 1; idx < valid_checkpoints.size(); ++idx) {
+            if (valid_checkpoints[idx].checkpoint_id < valid_checkpoints[oldest_index].checkpoint_id) {
                 oldest_index = idx;
             }
         }
-        const EpochEntry dropped = valid_epochs[oldest_index];
+        const CheckpointEntry dropped = valid_checkpoints[oldest_index];
         clear_indices.push_back(dropped.index);
         used_bytes -= dropped.bytes;
-        if (io_min_valid_epoch && dropped.epoch_id + 1u > *io_min_valid_epoch) {
-            *io_min_valid_epoch = dropped.epoch_id + 1u;
+        if (io_min_valid_checkpoint && dropped.checkpoint_id + 1u > *io_min_valid_checkpoint) {
+            *io_min_valid_checkpoint = dropped.checkpoint_id + 1u;
         }
-        valid_epochs.erase(valid_epochs.begin() + static_cast<std::ptrdiff_t>(oldest_index));
+        valid_checkpoints.erase(valid_checkpoints.begin() + static_cast<std::ptrdiff_t>(oldest_index));
         return true;
     };
 
     const OverwriteMode effective_overwrite = deterministic_ ? OverwriteMode::kBackpressure : cfg_.overwrite_mode;
     if (effective_overwrite == OverwriteMode::kBackpressure) {
-        if (cfg_.retention_epochs > 0 && valid_epochs.size() >= cfg_.retention_epochs) {
+        if (cfg_.retention_checkpoints > 0 && valid_checkpoints.size() >= cfg_.retention_checkpoints) {
             last_status_ = RecorderStatus::kBackpressure;
             return false;
         }
     } else {
-        if (cfg_.retention_epochs > 0) {
-            while (valid_epochs.size() >= cfg_.retention_epochs) {
-                drop_oldest(&min_valid_epoch);
+        if (cfg_.retention_checkpoints > 0) {
+            while (valid_checkpoints.size() >= cfg_.retention_checkpoints) {
+                drop_oldest(&min_valid_checkpoint);
             }
         }
     }
@@ -1895,30 +1895,30 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         }
     } else {
         while (estimated_bytes > (cfg_.ring_bytes - used_bytes)) {
-            if (!drop_oldest(&min_valid_epoch)) {
+            if (!drop_oldest(&min_valid_checkpoint)) {
                 last_status_ = RecorderStatus::kRingTooSmall;
                 return false;
             }
         }
     }
 
-    if (!clear_indices.empty() || min_valid_epoch != min_valid_epoch_) {
-        EpochRecord zero_record{};
+    if (!clear_indices.empty() || min_valid_checkpoint != min_valid_checkpoint_) {
+        CheckpointRecord zero_record{};
         for (uint32_t index : clear_indices) {
-            const size_t epoch_offset_bytes = sizeof(EpochRecord) * static_cast<size_t>(index);
-            err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_epochs_) + epoch_offset_bytes,
+            const size_t checkpoint_offset_bytes = sizeof(CheckpointRecord) * static_cast<size_t>(index);
+            err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_checkpoints_) + checkpoint_offset_bytes,
                 &zero_record,
-                sizeof(EpochRecord),
+                sizeof(CheckpointRecord),
                 cudaMemcpyHostToDevice);
             if (err != cudaSuccess) {
                 last_status_ = RecorderStatus::kCudaError;
                 return false;
             }
         }
-        min_valid_epoch_ = min_valid_epoch;
-        const size_t offset = offsetof(ControlBlock, min_valid_epoch);
+        min_valid_checkpoint_ = min_valid_checkpoint;
+        const size_t offset = offsetof(ControlBlock, min_valid_checkpoint);
         err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_control_) + offset,
-            &min_valid_epoch_,
+            &min_valid_checkpoint_,
             sizeof(uint32_t),
             cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
@@ -1951,7 +1951,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_baseline_ptrs_,
                 d_ring_,
                 cfg_.ring_bytes,
-                host_begin.epoch_id,
+                host_begin.checkpoint_id,
                 first_offset_ptr,
                 nullptr);
         } else {
@@ -1962,7 +1962,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
                 d_scratch_ptrs_,
                 d_ring_,
                 cfg_.ring_bytes,
-                host_begin.epoch_id,
+                host_begin.checkpoint_id,
                 chunk.payload_bytes,
                 first_offset_ptr,
                 nullptr);
@@ -1995,7 +1995,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             last_status_ = RecorderStatus::kCudaError;
             return false;
         }
-        stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampEpochEnd);
+        stamp_kernel<<<1, 1, 0, stream>>>(d_graph_stamps_, d_stamp_base_, kStampCheckpointEnd);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             last_status_ = RecorderStatus::kCudaError;
@@ -2053,25 +2053,25 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         return false;
     }
 
-    uint64_t epoch_bytes = host_control_after.write_pos - host_control.write_pos;
-    if (epoch_bytes > UINT32_MAX) {
+    uint64_t checkpoint_bytes = host_control_after.write_pos - host_control.write_pos;
+    if (checkpoint_bytes > UINT32_MAX) {
         last_status_ = RecorderStatus::kRingCorrupt;
         return false;
     }
 
-    EpochRecord record{};
-    record.epoch_id = host_begin.epoch_id;
+    CheckpointRecord record{};
+    record.checkpoint_id = host_begin.checkpoint_id;
     record.chunk_count = enabled_count;
     record.region_count = enabled_count;
-    record.reserved0 = static_cast<uint32_t>(epoch_bytes);
+    record.reserved0 = static_cast<uint32_t>(checkpoint_bytes);
     record.ring_offset = first_written ? first_ring_offset : 0u;
-    record.reserved1 = host_begin.epoch_id / cfg_.epoch_capacity;
+    record.reserved1 = host_begin.checkpoint_id / cfg_.checkpoint_capacity;
     record.timestamp = 0;
 
-    const size_t epoch_offset_bytes = sizeof(EpochRecord) * static_cast<size_t>(host_begin.epoch_index_pos);
-    err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_epochs_) + epoch_offset_bytes,
+    const size_t checkpoint_offset_bytes = sizeof(CheckpointRecord) * static_cast<size_t>(host_begin.checkpoint_index_pos);
+    err = cudaMemcpy(reinterpret_cast<uint8_t*>(d_checkpoints_) + checkpoint_offset_bytes,
         &record,
-        sizeof(EpochRecord),
+        sizeof(CheckpointRecord),
         cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         last_status_ = RecorderStatus::kCudaError;
@@ -2079,10 +2079,10 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
     }
 
     if (enable_manifest_) {
-        ManifestEpoch manifest_epoch{};
-        manifest_epoch.epoch_id = host_begin.epoch_id;
-        manifest_epoch.ring_bytes_written = static_cast<uint32_t>(epoch_bytes);
-        manifest_epoch.regions.reserve(pending.size());
+        ManifestCheckpoint manifest_checkpoint{};
+        manifest_checkpoint.checkpoint_id = host_begin.checkpoint_id;
+        manifest_checkpoint.ring_bytes_written = static_cast<uint32_t>(checkpoint_bytes);
+        manifest_checkpoint.regions.reserve(pending.size());
         for (const PendingChunk& chunk : pending) {
             const TrackedRegion& region = host_regions_[chunk.region_index];
             ManifestRegion manifest_region{};
@@ -2092,9 +2092,9 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
             manifest_region.payload_bytes = chunk.payload_bytes;
             manifest_region.uncompressed_bytes = region.size_bytes;
             manifest_region.snapshot = (chunk.chunk_type == kChunkTypeSnapshot);
-            manifest_epoch.regions.push_back(manifest_region);
+            manifest_checkpoint.regions.push_back(manifest_region);
         }
-        manifest_epochs_.push_back(std::move(manifest_epoch));
+        manifest_checkpoints_.push_back(std::move(manifest_checkpoint));
     }
 
     if (cfg_.enable_dep_stamps && dep_count > 0u && dep_stamp_base_valid) {
@@ -2102,7 +2102,7 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
         for (size_t i = 0; i < deps.count; ++i) {
             const CaptureDependency& dep = deps.deps[i];
             DepWaitRecord wait{};
-            wait.epoch_id = host_begin.epoch_id;
+            wait.checkpoint_id = host_begin.checkpoint_id;
             wait.region_id = dep.region_id;
             wait.event_ptr = reinterpret_cast<uint64_t>(dep.event);
             wait.producer_stream = reinterpret_cast<uint64_t>(dep.producer_stream);
@@ -2116,64 +2116,64 @@ bool Recorder::capture_epoch(cudaStream_t stream, const CaptureDeps& deps) {
     return true;
 }
 
-bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
+bool Recorder::rewind_to_checkpoint(uint32_t target_checkpoint, cudaStream_t stream) {
     last_status_ = RecorderStatus::kOk;
     if (!initialized_) {
         last_status_ = RecorderStatus::kNotInitialized;
         return false;
     }
-    if (target_epoch < min_valid_epoch_) {
-        last_status_ = RecorderStatus::kEpochDropped;
+    if (target_checkpoint < min_valid_checkpoint_) {
+        last_status_ = RecorderStatus::kCheckpointDropped;
         return false;
     }
 
-    std::vector<EpochRecord> host_epochs;
-    if (!read_epochs_to_host(host_epochs)) {
+    std::vector<CheckpointRecord> host_checkpoints;
+    if (!read_checkpoints_to_host(host_checkpoints)) {
         return false;
     }
 
     bool found_target = false;
     bool any_chunks = false;
-    uint32_t min_epoch = UINT32_MAX;
-    for (const EpochRecord& record : host_epochs) {
+    uint32_t min_checkpoint = UINT32_MAX;
+    for (const CheckpointRecord& record : host_checkpoints) {
         if (record.chunk_count == 0) {
             continue;
         }
-        if (record.epoch_id < min_valid_epoch_) {
+        if (record.checkpoint_id < min_valid_checkpoint_) {
             continue;
         }
         if (record.reserved0 == 0u) {
             continue;
         }
-        uint32_t expected_generation = record.epoch_id / cfg_.epoch_capacity;
+        uint32_t expected_generation = record.checkpoint_id / cfg_.checkpoint_capacity;
         if (record.reserved1 != expected_generation) {
             continue;
         }
         any_chunks = true;
-        if (record.epoch_id < min_epoch) {
-            min_epoch = record.epoch_id;
+        if (record.checkpoint_id < min_checkpoint) {
+            min_checkpoint = record.checkpoint_id;
         }
-        if (record.epoch_id == target_epoch) {
+        if (record.checkpoint_id == target_checkpoint) {
             found_target = true;
         }
     }
 
     if (!found_target) {
-        last_status_ = RecorderStatus::kEpochNotFound;
+        last_status_ = RecorderStatus::kCheckpointNotFound;
         return false;
     }
     if (!any_chunks) {
         return true;
     }
-    if (target_epoch < min_epoch) {
-        last_status_ = RecorderStatus::kEpochDropped;
+    if (target_checkpoint < min_checkpoint) {
+        last_status_ = RecorderStatus::kCheckpointDropped;
         return false;
     }
 
-    for (uint32_t epoch_id = min_epoch; epoch_id <= target_epoch; ++epoch_id) {
-        const EpochRecord* record = nullptr;
-        for (const EpochRecord& candidate : host_epochs) {
-            if (candidate.epoch_id == epoch_id) {
+    for (uint32_t checkpoint_id = min_checkpoint; checkpoint_id <= target_checkpoint; ++checkpoint_id) {
+        const CheckpointRecord* record = nullptr;
+        for (const CheckpointRecord& candidate : host_checkpoints) {
+            if (candidate.checkpoint_id == checkpoint_id) {
                 record = &candidate;
                 break;
             }
@@ -2181,17 +2181,17 @@ bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
         if (!record) {
             continue;
         }
-        if (record->epoch_id < min_valid_epoch_) {
+        if (record->checkpoint_id < min_valid_checkpoint_) {
             continue;
         }
         if (record->chunk_count == 0 || record->reserved0 == 0u) {
             continue;
         }
-        uint32_t expected_generation = record->epoch_id / cfg_.epoch_capacity;
+        uint32_t expected_generation = record->checkpoint_id / cfg_.checkpoint_capacity;
         if (record->reserved1 != expected_generation) {
             continue;
         }
-        RecorderStatus status = rewind_apply_epoch(*record,
+        RecorderStatus status = rewind_apply_checkpoint(*record,
             d_regions_,
             cfg_.region_capacity,
             d_baseline_ptrs_,
@@ -2207,16 +2207,16 @@ bool Recorder::rewind_to_epoch(uint32_t target_epoch, cudaStream_t stream) {
     return true;
 }
 
-bool Recorder::read_epochs_to_host(std::vector<EpochRecord>& out) {
+bool Recorder::read_checkpoints_to_host(std::vector<CheckpointRecord>& out) {
     out.clear();
     if (!initialized_) {
         last_status_ = RecorderStatus::kNotInitialized;
         return false;
     }
-    out.resize(cfg_.epoch_capacity);
+    out.resize(cfg_.checkpoint_capacity);
     cudaError_t err = cudaMemcpy(out.data(),
-        d_epochs_,
-        sizeof(EpochRecord) * cfg_.epoch_capacity,
+        d_checkpoints_,
+        sizeof(CheckpointRecord) * cfg_.checkpoint_capacity,
         cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         out.clear();
@@ -2243,18 +2243,18 @@ bool Recorder::write_manifest_json(const char* path) const {
     }
 
     out.imbue(std::locale::classic());
-    out << "{ \"epochs\": [";
-    for (size_t i = 0; i < manifest_epochs_.size(); ++i) {
-        const ManifestEpoch& epoch = manifest_epochs_[i];
+    out << "{ \"checkpoints\": [";
+    for (size_t i = 0; i < manifest_checkpoints_.size(); ++i) {
+        const ManifestCheckpoint& checkpoint = manifest_checkpoints_[i];
         if (i > 0) {
             out << ",";
         }
         out << "{";
-        out << "\"epoch_id\":" << epoch.epoch_id;
-        out << ",\"ring_bytes_written\":" << epoch.ring_bytes_written;
+        out << "\"checkpoint_id\":" << checkpoint.checkpoint_id;
+        out << ",\"ring_bytes_written\":" << checkpoint.ring_bytes_written;
         out << ",\"regions\":[";
-        for (size_t r = 0; r < epoch.regions.size(); ++r) {
-            const ManifestRegion& region = epoch.regions[r];
+        for (size_t r = 0; r < checkpoint.regions.size(); ++r) {
+            const ManifestRegion& region = checkpoint.regions[r];
             if (r > 0) {
                 out << ",";
             }
@@ -2287,7 +2287,7 @@ bool Recorder::write_manifest_json(const char* path) const {
 }
 
 void Recorder::clear_manifest() {
-    manifest_epochs_.clear();
+    manifest_checkpoints_.clear();
 }
 
 } // namespace tt
