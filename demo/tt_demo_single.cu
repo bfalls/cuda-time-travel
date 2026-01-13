@@ -71,6 +71,115 @@ namespace {
 		return mask;
 	}
 
+	const char* parse_tt_show_list() {
+		const char* prefix = "--tt-show=";
+		const size_t prefix_len = std::strlen(prefix);
+		for (int i = 1; i < __argc; ++i) {
+			const char* arg = __argv[i];
+			if (std::strncmp(arg, prefix, prefix_len) == 0) {
+				return arg + prefix_len;
+			}
+		}
+		return nullptr;
+	}
+
+	void append_unique_checkpoint(std::vector<uint32_t>& out, uint32_t checkpoint) {
+		for (uint32_t existing : out) {
+			if (existing == checkpoint) {
+				return;
+			}
+		}
+		out.push_back(checkpoint);
+	}
+
+	void resolve_tt_show_checkpoints(const char* list,
+		uint32_t first_bad,
+		uint32_t checkpoint_count,
+		std::vector<uint32_t>& out) {
+		out.clear();
+		if (!list || list[0] == '\0') {
+			return;
+		}
+
+		const char* p = list;
+		while (*p) {
+			while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+			if (*p == '\0') break;
+
+			const char* token_start = p;
+			while (*p && *p != ',') ++p;
+			const char* token_end = p;
+
+			while (token_end > token_start && (token_end[-1] == ' ' || token_end[-1] == '\t')) {
+				--token_end;
+			}
+			const size_t token_len = static_cast<size_t>(token_end - token_start);
+			if (token_len == 0) {
+				continue;
+			}
+
+			bool has_value = false;
+			uint32_t value = 0;
+
+			if (token_len == 8 && std::strncmp(token_start, "firstbad", 8) == 0) {
+				value = first_bad;
+				has_value = true;
+			}
+			else if (token_len == 4 && std::strncmp(token_start, "prev", 4) == 0) {
+				if (first_bad > 0) {
+					value = first_bad - 1u;
+					has_value = true;
+				}
+			}
+			else {
+				uint64_t parsed = 0;
+				bool valid = true;
+				bool any = false;
+				for (const char* c = token_start; c < token_end; ++c) {
+					if (*c < '0' || *c > '9') {
+						valid = false;
+						break;
+					}
+					any = true;
+					parsed = parsed * 10u + static_cast<uint64_t>(*c - '0');
+					if (parsed > 0xFFFFFFFFull) {
+						valid = false;
+						break;
+					}
+				}
+				if (valid && any) {
+					value = static_cast<uint32_t>(parsed);
+					has_value = true;
+				}
+			}
+
+			if (has_value && value < checkpoint_count) {
+				append_unique_checkpoint(out, value);
+			}
+		}
+	}
+
+	const char* recorder_status_to_string(tt::RecorderStatus status) {
+		switch (status) {
+		case tt::RecorderStatus::kOk: return "ok";
+		case tt::RecorderStatus::kNotInitialized: return "not initialized";
+		case tt::RecorderStatus::kInvalidConfig: return "invalid config";
+		case tt::RecorderStatus::kInvalidDependency: return "invalid dependency";
+		case tt::RecorderStatus::kCudaError: return "cuda error";
+		case tt::RecorderStatus::kBackpressure: return "backpressure";
+		case tt::RecorderStatus::kRingTooSmall: return "ring too small";
+		case tt::RecorderStatus::kRingCorrupt: return "ring corrupt";
+		case tt::RecorderStatus::kInvalidHeader: return "invalid header";
+		case tt::RecorderStatus::kInvalidChunkType: return "invalid chunk type";
+		case tt::RecorderStatus::kInvalidPayload: return "invalid payload";
+		case tt::RecorderStatus::kAlignmentError: return "alignment error";
+		case tt::RecorderStatus::kCheckpointNotFound: return "checkpoint not found";
+		case tt::RecorderStatus::kCheckpointDropped: return "checkpoint dropped";
+		case tt::RecorderStatus::kDeterminismViolation: return "determinism violation";
+		default: return "unknown";
+		}
+	}
+
 	__global__ void write_pattern_kernel(uint32_t* data, uint32_t count, uint32_t checkpoint) {
 		const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
 		if (idx < count) {
@@ -239,8 +348,42 @@ namespace {
 		uint32_t add_per_checkpoint,
 		uint32_t element_count);
 
+	uint32_t find_first_bad_checkpoint_accum_strict(tt::Recorder& recorder,
+		cudaStream_t stream,
+		uint32_t* d_buffer,
+		uint32_t size_bytes,
+		uint32_t checkpoint_count,
+		uint32_t add_per_checkpoint,
+		uint32_t element_count);
+
+	void build_expected_accum_u64(std::vector<uint64_t>& host_ref_u64,
+		uint32_t checkpoint,
+		uint32_t add_per_checkpoint);
+
+	bool find_first_mismatch_accum(const std::vector<uint32_t>& host_out,
+		const std::vector<uint64_t>& host_ref_u64,
+		uint32_t* out_index,
+		uint64_t* out_expected,
+		uint32_t* out_actual);
+
+	bool find_first_mismatch_accum_u64(const std::vector<uint32_t>& host_out,
+		const std::vector<uint64_t>& host_ref_u64,
+		uint32_t* out_index,
+		uint64_t* out_expected,
+		uint32_t* out_actual);
+
+	bool accum_checkpoint_is_good_strict(tt::Recorder& recorder,
+		cudaStream_t stream,
+		uint32_t* d_buffer,
+		uint32_t size_bytes,
+		uint32_t checkpoint,
+		uint32_t add_per_checkpoint,
+		std::vector<uint32_t>& host_out,
+		std::vector<uint64_t>& host_ref_u64);
+
 	static bool run_accum_overflow_demo(
 		bool tt_debug,
+		const char* tt_show_list,
 		cudaStream_t stream,
 		uint32_t* d_buffer,
 		uint32_t element_count,
@@ -287,6 +430,7 @@ namespace {
 
 		tt::Recorder* recorder = tt_debug ? &recorder_local : nullptr;
 		tt::TraceCollector* trace = tt_debug ? &trace_local : nullptr;
+		const bool enable_tt_show = tt_debug && tt_show_list && tt_show_list[0] != '\0';
 
 		const double t_init0 = now_us();
 		if (!check_cuda(cudaMemsetAsync(d_buffer, 0, size_bytes, stream), "cudaMemsetAsync (accum demo)")) {
@@ -299,7 +443,7 @@ namespace {
 			trace_local.write("trace/tt_demo_accum_overflow-bug.json");
 			return false;
 		}
-		if (trace)
+		if (tt_debug)
 			add_event(*trace, "init_zero", "accum_demo", t_init0, (now_us() - t_init0), 0, 0);
 
 		const uint32_t threads = 256;
@@ -308,9 +452,12 @@ namespace {
 		uint32_t verified_checkpoints = 0;
 		std::vector<uint32_t> host_out(element_count, 0u);
 		std::vector<uint64_t> host_ref(element_count, 0ull);
+		bool found_bad = false;
+		uint32_t last_checkpoint = 0;
 
 		for (uint32_t checkpoint = 0; checkpoint < checkpoint_count; ++checkpoint) {
 			const double t0 = now_us();
+			last_checkpoint = checkpoint;
 
 			accumulate_offset_u32_kernel << <blocks, threads, 0, stream >> > (d_buffer, element_count, add_per_checkpoint);
 			if (!check_cuda(cudaGetLastError(), "launch accumulate_offset_u32_kernel")) {
@@ -318,7 +465,7 @@ namespace {
 				trace_local.write("trace/tt_demo_accum_overflow-bug.json");
 				return false;
 			}
-			if (trace) {
+			if (tt_debug) {
 				add_event(*trace, "accum_kernel", "accum_demo", now_us(), 0.0, checkpoint, 0);
 
 				if (!(*recorder).capture_checkpoint(stream)) {
@@ -331,27 +478,34 @@ namespace {
 				add_event(*trace, "checkpoint", "accum_demo", t0, (now_us() - t0), checkpoint, 2);
 			}
 
-			for (uint32_t i = 0; i < element_count; ++i) {
-				host_ref[i] += static_cast<uint64_t>(add_per_checkpoint + (i & 0xFFu));
-			}
+			if (!found_bad) {
+				for (uint32_t i = 0; i < element_count; ++i) {
+					host_ref[i] += static_cast<uint64_t>(add_per_checkpoint + (i & 0xFFu));
+				}
 
-			if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes,
-				cudaMemcpyDeviceToHost), "memcpy out (accum demo verify)")) {
-				break;
-			}
-
-			bool ok = true;
-			for (uint32_t i = 0; i < element_count; ++i) {
-				if (static_cast<uint64_t>(host_out[i]) != host_ref[i]) {
-					ok = false;
+				if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes,
+					cudaMemcpyDeviceToHost), "memcpy out (accum demo verify)")) {
 					break;
 				}
-			}
-			if (!ok) {
-				break;
+
+				bool ok = true;
+				for (uint32_t i = 0; i < element_count; ++i) {
+					if (static_cast<uint64_t>(host_out[i]) != host_ref[i]) {
+						ok = false;
+						break;
+					}
+				}
+				if (!ok) {
+					found_bad = true;
+					if (!enable_tt_show) {
+						break;
+					}
+				}
 			}
 
-			++verified_checkpoints;
+			if (!found_bad) {
+				++verified_checkpoints;
+			}
 		}
 
 		if (!check_cuda(cudaStreamSynchronize(stream), "final sync (accum demo)")) {
@@ -360,8 +514,10 @@ namespace {
 			return false;
 		}
 
-		std::printf("verified_checkpoints=%u (expected %u)\n",
-			verified_checkpoints, checkpoint_count);
+		std::printf("verified_good_checkpoints=%u (checkpoints [0..%u] passed, expected %u total)\n",
+			verified_checkpoints,
+			verified_checkpoints == 0 ? 0u : (verified_checkpoints - 1u),
+			checkpoint_count);
 
 		if (out_verified_checkpoints) {
 			*out_verified_checkpoints = verified_checkpoints;
@@ -371,10 +527,77 @@ namespace {
 		trace_local.write("trace/tt_demo_accum_overflow-bug.json");
 
 		if (!ok && tt_debug && verified_checkpoints < checkpoint_count) {
-			const uint32_t first_bad = find_first_bad_checkpoint_accum(recorder_local, stream, d_buffer,
-				size_bytes, checkpoint_count, add_per_checkpoint, element_count);
+			const uint32_t first_bad = enable_tt_show
+				? find_first_bad_checkpoint_accum_strict(recorder_local, stream, d_buffer,
+					size_bytes, checkpoint_count, add_per_checkpoint, element_count)
+				: find_first_bad_checkpoint_accum(recorder_local, stream, d_buffer,
+					size_bytes, checkpoint_count, add_per_checkpoint, element_count);
 			trace_local.write("trace/tt_demo_accum_overflow-ttdebug.json");
-			std::printf("tt_debug_first_bad_checkpoint=%u\n", first_bad);
+			std::printf("first_bad_checkpoint_index=%u\n", first_bad);
+
+			if (enable_tt_show) {
+				std::vector<uint32_t> show_checkpoints;
+				resolve_tt_show_checkpoints(tt_show_list, first_bad, checkpoint_count, show_checkpoints);
+				if (!show_checkpoints.empty()) {
+					uint32_t max_checkpoint = last_checkpoint;
+					for (uint32_t checkpoint : show_checkpoints) {
+						if (checkpoint > max_checkpoint) {
+							max_checkpoint = checkpoint;
+						}
+					}
+					for (uint32_t checkpoint = last_checkpoint + 1u;
+						checkpoint <= max_checkpoint && checkpoint < checkpoint_count;
+						++checkpoint) {
+						accumulate_offset_u32_kernel << <blocks, threads, 0, stream >> > (d_buffer, element_count, add_per_checkpoint);
+						if (!check_cuda(cudaGetLastError(), "launch accumulate_offset_u32_kernel (tt show)")) {
+							recorder_local.shutdown();
+							trace_local.write("trace/tt_demo_accum_overflow-ttdebug.json");
+							return false;
+						}
+						if (!recorder_local.capture_checkpoint(stream)) {
+							std::printf("capture_checkpoint failed at %u (accum demo tt show)\n", checkpoint);
+							recorder_local.shutdown();
+							trace_local.write("trace/tt_demo_accum_overflow-ttdebug.json");
+							return false;
+						}
+					}
+					if (!check_cuda(cudaStreamSynchronize(stream), "sync (accum demo tt show)")) {
+						recorder_local.shutdown();
+						trace_local.write("trace/tt_demo_accum_overflow-ttdebug.json");
+						return false;
+					}
+				}
+				for (uint32_t checkpoint : show_checkpoints) {
+					if (!recorder_local.rewind_to_checkpoint(checkpoint, stream)) {
+						std::printf("[tt] inspect checkpoint %u: FAIL\n", checkpoint);
+						std::printf("rewind failed: %s\n", recorder_status_to_string(recorder_local.last_status()));
+						continue;
+					}
+					if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes,
+						cudaMemcpyDeviceToHost), "memcpy out (accum demo inspect)")) {
+						std::printf("[tt] inspect checkpoint %u: FAIL\n", checkpoint);
+						std::printf("copy failed\n");
+						continue;
+					}
+
+					build_expected_accum_u64(host_ref, checkpoint, add_per_checkpoint);
+					uint32_t mismatch_index = 0;
+					uint64_t expected = 0;
+					uint32_t actual = 0;
+					const bool mismatch = find_first_mismatch_accum_u64(host_out, host_ref,
+						&mismatch_index, &expected, &actual);
+					if (!mismatch) {
+						std::printf("[tt] inspect checkpoint %u: OK\n", checkpoint);
+					}
+					else {
+						std::printf("[tt] inspect checkpoint %u: FAIL\n", checkpoint);
+						std::printf("first mismatch at element %u\n", mismatch_index);
+						std::printf("expected=0x%016llx actual=0x%016llx\n",
+							static_cast<unsigned long long>(expected),
+							static_cast<unsigned long long>(actual));
+					}
+				}
+			}
 		}
 
 		recorder_local.shutdown();
@@ -388,6 +611,42 @@ namespace {
 		for (uint32_t i = 0; i < host_ref_u64.size(); ++i) {
 			host_ref_u64[i] = mul * static_cast<uint64_t>(add_per_checkpoint + (i & 0xFFu));
 		}
+	}
+
+	bool find_first_mismatch_accum(const std::vector<uint32_t>& host_out,
+		const std::vector<uint64_t>& host_ref_u64,
+		uint32_t* out_index,
+		uint64_t* out_expected,
+		uint32_t* out_actual) {
+		for (uint32_t i = 0; i < host_out.size(); ++i) {
+			const uint64_t expected = host_ref_u64[i];
+			const uint32_t actual = host_out[i];
+			if (actual != static_cast<uint32_t>(expected)) {
+				if (out_index) *out_index = i;
+				if (out_expected) *out_expected = expected;
+				if (out_actual) *out_actual = actual;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool find_first_mismatch_accum_u64(const std::vector<uint32_t>& host_out,
+		const std::vector<uint64_t>& host_ref_u64,
+		uint32_t* out_index,
+		uint64_t* out_expected,
+		uint32_t* out_actual) {
+		for (uint32_t i = 0; i < host_out.size(); ++i) {
+			const uint64_t expected = host_ref_u64[i];
+			const uint64_t actual = static_cast<uint64_t>(host_out[i]);
+			if (actual != expected) {
+				if (out_index) *out_index = i;
+				if (out_expected) *out_expected = expected;
+				if (out_actual) *out_actual = static_cast<uint32_t>(actual);
+				return true;
+			}
+		}
+		return false;
 	}
 
 	bool accum_checkpoint_is_good(tt::Recorder& recorder,
@@ -408,12 +667,28 @@ namespace {
 		}
 
 		build_expected_accum_u64(host_ref_u64, checkpoint, add_per_checkpoint);
-		for (uint32_t i = 0; i < host_out.size(); ++i) {
-			if (host_out[i] != static_cast<uint32_t>(host_ref_u64[i])) {
-				return false;
-			}
+		return !find_first_mismatch_accum(host_out, host_ref_u64, nullptr, nullptr, nullptr);
+	}
+
+	bool accum_checkpoint_is_good_strict(tt::Recorder& recorder,
+		cudaStream_t stream,
+		uint32_t* d_buffer,
+		uint32_t size_bytes,
+		uint32_t checkpoint,
+		uint32_t add_per_checkpoint,
+		std::vector<uint32_t>& host_out,
+		std::vector<uint64_t>& host_ref_u64) {
+
+		if (!recorder.rewind_to_checkpoint(checkpoint, stream)) {
+			return false;
 		}
-		return true;
+		if (!check_cuda(cudaMemcpy(host_out.data(), d_buffer, size_bytes,
+			cudaMemcpyDeviceToHost), "memcpy out (accum demo rewind strict)")) {
+			return false;
+		}
+
+		build_expected_accum_u64(host_ref_u64, checkpoint, add_per_checkpoint);
+		return !find_first_mismatch_accum_u64(host_out, host_ref_u64, nullptr, nullptr, nullptr);
 	}
 
 	uint32_t find_first_bad_checkpoint_accum(tt::Recorder& recorder,
@@ -453,12 +728,50 @@ namespace {
 		return first_bad;
 	}
 
+	uint32_t find_first_bad_checkpoint_accum_strict(tt::Recorder& recorder,
+		cudaStream_t stream,
+		uint32_t* d_buffer,
+		uint32_t size_bytes,
+		uint32_t checkpoint_count,
+		uint32_t add_per_checkpoint,
+		uint32_t element_count) {
+
+		std::vector<uint32_t> host_out(element_count, 0u);
+		std::vector<uint64_t> host_ref_u64(element_count, 0ull);
+
+		uint32_t lo = 0;
+		uint32_t hi = checkpoint_count;
+		while (lo < hi) {
+			const uint32_t mid = lo + (hi - lo) / 2u;
+			if (accum_checkpoint_is_good_strict(recorder, stream, d_buffer, size_bytes, mid,
+				add_per_checkpoint, host_out, host_ref_u64)) {
+				lo = mid + 1u;
+			}
+			else {
+				hi = mid;
+			}
+		}
+
+		uint32_t first_bad = lo;
+		const uint32_t linear_start = (first_bad > 2u) ? (first_bad - 2u) : 0u;
+		for (uint32_t e = linear_start; e <= first_bad && e < checkpoint_count; ++e) {
+			if (!accum_checkpoint_is_good_strict(recorder, stream, d_buffer, size_bytes, e,
+				add_per_checkpoint, host_out, host_ref_u64)) {
+				first_bad = e;
+				break;
+			}
+		}
+
+		return first_bad;
+	}
+
 } // namespace
 
 int main() {
 	const bool bug_mode = has_flag("--bug");           // off-by-one demo bug
 	const bool sync_bug = has_flag("--sync-bug");      // sync fence demo bug
 	const bool tt_debug = has_flag("--tt-debug");      // demo 3 postmortem debug
+	const char* tt_show_list = parse_tt_show_list();
 
 	const uint32_t demo_mask = parse_demo_mask();
 	const bool run_demo1 = (demo_mask & (1u << 1)) != 0;
@@ -604,6 +917,7 @@ int main() {
 		uint32_t verified_checkpoints = 0;
 		const bool demo3_ok = run_accum_overflow_demo(
 			tt_debug,
+			tt_show_list,
 			stream, d_buffer, element_count, size_bytes,
 			checkpoint_count3, add_per_checkpoint, trace3_start, &verified_checkpoints);
 		if (!demo3_ok) {
